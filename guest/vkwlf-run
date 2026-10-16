@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# vkwlf-run — run a Wayland app inside the Android desktop Terminal VM and have it
+# displayed as a native Android window by VkWlfApp on the host.
+#
+#   vkwlf-run [--host IP] [--port N] [--size WxH] -- <wayland app> [args...]
+#
+# Starts vkwlf_guest_proxy (an in-VM Wayland compositor that forwards frames to
+# VkWlfApp over TCP) on a private XDG_RUNTIME_DIR, waits for its socket, then
+# execs the app with WAYLAND_DISPLAY pointing at it.
+#
+# Host/port discovery:
+#   --host   defaults to $VKWLF_HOST_IP, else the VM's default gateway (the Android host).
+#   --port   defaults to $VKWLF_PORT, else 5555; VkWlfApp falls back to 5556 when 5555
+#            is busy (adbd uses it when wireless debugging is on) — check logcat for
+#            "Bound TCP Wayland Bridge listener on 0.0.0.0:<port>".
+set -euo pipefail
+HOST="${VKWLF_HOST_IP:-}"; PORT="${VKWLF_PORT:-5555}"; SIZE="${VKWLF_SIZE:-1600x900}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --host) HOST="$2"; shift 2;;
+    --port) PORT="$2"; shift 2;;
+    --size) SIZE="$2"; shift 2;;
+    --) shift; break;;
+    -h|--help) sed -n '2,16p' "$0"; exit 0;;
+    *) break;;
+  esac
+done
+[[ $# -gt 0 ]] || { echo "usage: vkwlf-run [--host IP] [--port N] -- <app> [args]" >&2; exit 2; }
+[[ -n "$HOST" ]] || HOST="$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}')"
+[[ -n "$HOST" ]] || { echo "cannot determine host IP; pass --host" >&2; exit 1; }
+PROXY="${VKWLF_GUEST_PROXY:-$(command -v vkwlf_guest_proxy || echo "$(dirname "$0")/vkwlf_guest_proxy")}"
+[[ -x "$PROXY" ]] || { echo "vkwlf_guest_proxy not found (set VKWLF_GUEST_PROXY)" >&2; exit 1; }
+
+RT="/tmp/vkwlf-xdg-$(id -u)"; mkdir -p "$RT"; chmod 700 "$RT"
+SOCK="$RT/wayland-0"; rm -f "$SOCK" "$SOCK.lock"
+W="${SIZE%x*}"; H="${SIZE#*x}"
+
+echo "vkwlf-run: proxy -> $HOST:$PORT, display $SOCK (${W}x${H})"
+"$PROXY" --socket "$SOCK" --host-ip "$HOST" --tcp-port "$PORT" --vsock-port 0 \
+         --width "$W" --height "$H" > "$RT/proxy.log" 2>&1 &
+PROXY_PID=$!
+trap 'kill $PROXY_PID 2>/dev/null || true' EXIT
+for _ in $(seq 1 50); do
+  [[ -S "$SOCK" ]] && break
+  kill -0 "$PROXY_PID" 2>/dev/null || { echo "proxy exited:"; tail -5 "$RT/proxy.log"; exit 1; }
+  sleep 0.1
+done
+[[ -S "$SOCK" ]] || { echo "proxy did not create $SOCK"; tail -5 "$RT/proxy.log"; exit 1; }
+
+export XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY="wayland-0" GDK_BACKEND=wayland QT_QPA_PLATFORM=wayland \
+       MOZ_ENABLE_WAYLAND=1 ELECTRON_OZONE_PLATFORM_HINT=wayland
+"$@" &
+APP_PID=$!
+wait "$APP_PID"

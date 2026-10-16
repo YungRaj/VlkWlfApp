@@ -1,0 +1,149 @@
+// Copyright (C) 2026 The Android Open Source Project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+genrule {
+    name: "vkwlf_wayland_protocols_headers",
+    tools: ["wayland_scanner"],
+    srcs: [
+        ":wayland_extension_protocols",
+    ],
+    cmd: "for xml in $(in); do " +
+         "  base=$$(basename $$xml .xml); " +
+         "  if [ \"$$base\" = \"xdg-shell\" ] || [ \"$$base\" = \"linux-dmabuf-unstable-v1\" ]; then " +
+         "    $(location wayland_scanner) server-header $$xml $(genDir)/$${base}-server-protocol.h; " +
+         "  fi; " +
+         "done",
+    out: [
+        "xdg-shell-server-protocol.h",
+        "linux-dmabuf-unstable-v1-server-protocol.h",
+    ],
+}
+
+genrule {
+    name: "vkwlf_wayland_protocols_sources",
+    tools: ["wayland_scanner"],
+    srcs: [
+        ":wayland_extension_protocols",
+    ],
+    cmd: "for xml in $(in); do " +
+         "  base=$$(basename $$xml .xml); " +
+         "  if [ \"$$base\" = \"xdg-shell\" ] || [ \"$$base\" = \"linux-dmabuf-unstable-v1\" ]; then " +
+         "    $(location wayland_scanner) private-code $$xml $(genDir)/$${base}-protocol.c; " +
+         "  fi; " +
+         "done",
+    out: [
+        "xdg-shell-protocol.c",
+        "linux-dmabuf-unstable-v1-protocol.c",
+    ],
+}
+
+cc_defaults {
+    name: "vkwlf_native_defaults",
+    cpp_std: "c++20",
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-DVK_USE_PLATFORM_ANDROID_KHR",
+    ],
+    local_include_dirs: [
+        "include",
+    ],
+    generated_headers: [
+        "vkwlf_wayland_protocols_headers",
+    ],
+    generated_sources: [
+        "vkwlf_wayland_protocols_sources",
+    ],
+    shared_libs: [
+        "libandroid",
+        "libnativewindow",
+        "libvulkan",
+        "liblog",
+    ],
+    static_libs: [
+        "libwayland_server",
+        "libffi",
+    ],
+}
+
+cc_library_shared {
+    name: "libvkwlf_jni",
+    defaults: ["vkwlf_native_defaults"],
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.virt",
+    ],
+    srcs: [
+        "src/wayland_server_engine.cpp",
+        "src/vk_renderer.cpp",
+        "src/input_handler.cpp",
+        "src/main.cpp",
+    ],
+}
+
+cc_binary {
+    name: "vkwlf_compositor",
+    defaults: ["vkwlf_native_defaults"],
+    srcs: [
+        "src/wayland_server_engine.cpp",
+        "src/vk_renderer.cpp",
+        "src/input_handler.cpp",
+        "src/main.cpp",
+    ],
+}
+
+cc_binary_host {
+    name: "vkwlf_guest_proxy",
+    cpp_std: "c++20",
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    local_include_dirs: [
+        "include",
+    ],
+    generated_headers: [
+        "vkwlf_wayland_protocols_headers",
+    ],
+    generated_sources: [
+        "vkwlf_wayland_protocols_sources",
+    ],
+    static_libs: [
+        "libwayland_server",
+        "libffi",
+    ],
+    srcs: [
+        "src/wayland_server_engine.cpp",
+        "src/vk_renderer.cpp",
+        "src/input_handler.cpp",
+        "src/vkwlf_guest_proxy.cpp",
+    ],
+}
+
+android_app {
+    name: "VkWlfApp",
+    privileged: true,
+    platform_apis: true,
+    certificate: "platform",
+    manifest: "AndroidManifest.xml",
+    srcs: [
+        "java/**/*.java",
+    ],
+    jni_libs: [
+        "libvkwlf_jni",
+    ],
+    optimize: {
+        enabled: false,
+    },
+}

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Example IDE
+Exec=example-ide
+Type=Application
+Icon=example-ide
+StartupWMClass=example-ide

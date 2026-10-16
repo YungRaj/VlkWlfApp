@@ -1,0 +1,26 @@
+# Build outputs
+/build/
+/build_android/
+/build_apk/
+/build_overlay/
+*.apk
+*.so
+*.o
+*.a
+CMakeCache.txt
+CMakeFiles/
+
+# Local scratch screenshots / previews (kept out of the repo on purpose)
+/*.png
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Superseded by tools/vm_view.sh (kept locally only)
+/run_vm_window.py
+
+# build_apk.sh output
+/out/

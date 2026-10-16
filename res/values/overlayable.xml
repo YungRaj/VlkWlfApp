@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:android="http://schemas.android.com/apk/res/android">
+    <overlayable name="WaylandDynamicAppMeta">
+        <policy type="public">
+            <item type="drawable" name="ic_wayland_app" />
+            <item type="string" name="wayland_app_name" />
+        </policy>
+    </overlayable>
+</resources>
