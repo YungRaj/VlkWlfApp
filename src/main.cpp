@@ -33,6 +33,8 @@ struct AppBridgeState {
   std::unique_ptr<vkwlf::InputHandler> input;
   std::thread render_thread;
   std::atomic<bool> render_running{false};
+  std::atomic<uint32_t> latest_width{0};
+  std::atomic<uint32_t> latest_height{0};
   ANativeWindow* window = nullptr;
   std::mutex cache_mutex;
   std::unordered_map<uint32_t, vkwlf::CommittedFrame> cached_frames;
@@ -175,25 +177,36 @@ void StopRenderLoop();
 void StartRenderLoop(ANativeWindow* window, uint32_t width, uint32_t height) {
   StopRenderLoop();
 
+  if (width > 0 && height > 0) {
+    g_app.latest_width.store(width);
+    g_app.latest_height.store(height);
+  }
   EnsureServerStarted("/data/local/tmp/wayland-0", 5555, 5555, width, height);
 
   g_app.window = window;
   g_app.render_running.store(true);
   g_app.render_thread = std::thread([window, width, height]() {
     vkwlf::VkRenderer::Config vk_cfg;
-    vk_cfg.width = width;
-    vk_cfg.height = height;
+    vk_cfg.width = g_app.latest_width.load() > 0 ? g_app.latest_width.load() : width;
+    vk_cfg.height = g_app.latest_height.load() > 0 ? g_app.latest_height.load() : height;
     auto local_renderer = std::make_unique<vkwlf::VkRenderer>(vk_cfg);
     if (!local_renderer->Initialize(window)) {
       LOGE(kTag, "Failed to initialize VkRenderer on render thread");
       return;
     }
+    uint32_t final_w = g_app.latest_width.load();
+    uint32_t final_h = g_app.latest_height.load();
+    if (final_w == 0 || final_h == 0) {
+      final_w = width;
+      final_h = height;
+    }
     {
       std::lock_guard<std::mutex> lock(g_app.renderer_mutex);
+      local_renderer->Resize(final_w, final_h);
       g_app.renderer = std::move(local_renderer);
     }
     if (g_app.server) {
-      g_app.server->SetDisplaySize(width, height);
+      g_app.server->SetDisplaySize(final_w, final_h);
     }
 
     // Immediately replay any cached surface frames if SurfaceView was recreated
@@ -313,6 +326,10 @@ Java_com_google_example_vkwlf_MainActivity_nativeOnSurfaceChanged(JNIEnv* /*env*
                                                                   jint width,
                                                                   jint height) {
   LOGI(kTag, "JNI nativeOnSurfaceChanged: %dx%d", width, height);
+  if (width > 0 && height > 0) {
+    g_app.latest_width.store(static_cast<uint32_t>(width));
+    g_app.latest_height.store(static_cast<uint32_t>(height));
+  }
   if (g_app.server) {
     g_app.server->SetDisplaySize(static_cast<uint32_t>(width), static_cast<uint32_t>(height));
   }

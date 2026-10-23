@@ -22,6 +22,7 @@ enum {
   AMOTION_EVENT_ACTION_DOWN = 0,
   AMOTION_EVENT_ACTION_UP = 1,
   AMOTION_EVENT_ACTION_MOVE = 2,
+  AMOTION_EVENT_ACTION_CANCEL = 3,
   AMOTION_EVENT_ACTION_HOVER_MOVE = 7,
   AMOTION_EVENT_ACTION_SCROLL = 8,
   AMOTION_EVENT_ACTION_BUTTON_PRESS = 11,
@@ -105,7 +106,9 @@ bool InputHandler::OnAndroidMotionEvent(int32_t action,
       return true;
     }
 
-    case AMOTION_EVENT_ACTION_UP: {
+    case AMOTION_EVENT_ACTION_UP:
+    case AMOTION_EVENT_ACTION_CANCEL: {
+      engine_->SendPointerMotion(time_ms, static_cast<double>(x), static_cast<double>(y));
       uint32_t btn = kBtnLeft;
       if (last_button_state_ & AMOTION_EVENT_BUTTON_SECONDARY) {
         btn = kBtnRight;
@@ -121,6 +124,7 @@ bool InputHandler::OnAndroidMotionEvent(int32_t action,
 
     case AMOTION_EVENT_ACTION_BUTTON_PRESS:
     case AMOTION_EVENT_ACTION_BUTTON_RELEASE: {
+      engine_->SendPointerMotion(time_ms, static_cast<double>(x), static_cast<double>(y));
       uint32_t wl_state = (masked_action == AMOTION_EVENT_ACTION_BUTTON_PRESS)
                               ? WL_POINTER_BUTTON_STATE_PRESSED
                               : WL_POINTER_BUTTON_STATE_RELEASED;
@@ -137,13 +141,14 @@ bool InputHandler::OnAndroidMotionEvent(int32_t action,
     }
 
     case AMOTION_EVENT_ACTION_SCROLL: {
+      engine_->SendPointerMotion(time_ms, static_cast<double>(x), static_cast<double>(y));
       if (vscroll != 0.0f) {
         engine_->SendPointerAxis(time_ms, WL_POINTER_AXIS_VERTICAL_SCROLL,
-                                 static_cast<double>(-vscroll * 15.0f));
+                                 static_cast<double>(-vscroll * 25.0f));
       }
       if (hscroll != 0.0f) {
         engine_->SendPointerAxis(time_ms, WL_POINTER_AXIS_HORIZONTAL_SCROLL,
-                                 static_cast<double>(hscroll * 15.0f));
+                                 static_cast<double>(hscroll * 25.0f));
       }
       return true;
     }

@@ -116,6 +116,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     hscroll,
                     event.getEventTime());
         });
+        mSurfaceView.addOnLayoutChangeListener(
+                (v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
+                    int w = right - left;
+                    int h = bottom - top;
+                    int oldW = oldRight - oldLeft;
+                    int oldH = oldBottom - oldTop;
+                    if (w > 0 && h > 0 && (w != oldW || h != oldH)) {
+                        nativeOnSurfaceChanged(w, h);
+                    }
+                });
 
         // --- App-drawn caption header -------------------------------------------------------
         // In desktop windowing the system header shows the *host package's* static label and

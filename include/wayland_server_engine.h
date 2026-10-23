@@ -136,6 +136,12 @@ class WaylandServerEngine {
                                struct wl_resource* xdg_toplevel_res);
   void UnregisterToplevelSurface(struct wl_resource* xdg_toplevel_res);
   void SetFocusedSurface(struct wl_resource* surface_res);
+  struct wl_resource* FocusedSurface() const { return focused_surface_; }
+  struct wl_resource* ResolvePointerTarget(double screen_x,
+                                           double screen_y,
+                                           double* out_local_x,
+                                           double* out_local_y) const;
+  void SetToplevelGeometry(int32_t crop_x, int32_t crop_y, uint32_t crop_w, uint32_t crop_h);
   void OnSurfaceUnmappedOrDestroyed(struct wl_resource* surface_res,
                                     uint32_t surface_id,
                                     bool was_drawable);
@@ -226,6 +232,24 @@ class WaylandServerEngine {
   struct wl_resource* focused_surface_ = nullptr;
   bool pointer_entered_ = false;
   bool keyboard_entered_ = false;
+  std::atomic<uint32_t> host_display_width_{0};
+  std::atomic<uint32_t> host_display_height_{0};
+  std::atomic<int32_t> last_crop_x_{0};
+  std::atomic<int32_t> last_crop_y_{0};
+  std::atomic<uint32_t> last_crop_w_{0};
+  std::atomic<uint32_t> last_crop_h_{0};
+  double last_pointer_x_ = 0.0;
+  double last_pointer_y_ = 0.0;
+  uint32_t pressed_buttons_mask_ = 0;
+  bool pending_left_press_ = false;
+  bool scroll_drag_active_ = false;
+  uint32_t down_time_ms_ = 0;
+  uint32_t last_button_event_time_ms_ = 0;
+  uint32_t last_motion_time_ms_ = 0;
+  double down_x_ = 0.0;
+  double down_y_ = 0.0;
+  double prev_scroll_x_ = 0.0;
+  double prev_scroll_y_ = 0.0;
 };
 
 }  // namespace vkwlf

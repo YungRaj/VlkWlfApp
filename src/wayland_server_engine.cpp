@@ -661,6 +661,8 @@ struct SurfaceState {
   bool app_launch_notified = false;
   bool attach_called = false;
   bool has_committed_buffer = false;
+  uint32_t committed_width = 0;
+  uint32_t committed_height = 0;
   int32_t popup_width = 0;
   int32_t popup_height = 0;
   // xdg_surface.set_window_geometry: the region of the buffer that is the actual
@@ -944,7 +946,7 @@ void SurfaceCommit(struct wl_client* /*client*/, struct wl_resource* resource) {
     }
   }
 
-  if (surf->xdg_toplevel_resource) {
+  if (surf->xdg_toplevel_resource && (!surf->has_committed_buffer || !engine->FocusedSurface())) {
     engine->SetFocusedSurface(surf->surface_resource);
   }
 
@@ -1046,6 +1048,11 @@ void SurfaceCommit(struct wl_client* /*client*/, struct wl_resource* resource) {
         crop_w = static_cast<uint32_t>(surf->geom_w);
         crop_h = static_cast<uint32_t>(surf->geom_h);
       }
+      if (surf->xdg_toplevel_resource != nullptr && surf->parent_surface_id == 0 &&
+          crop_w >= (engine->config().display_width * 3) / 4 &&
+          crop_h >= (engine->config().display_height * 3) / 4) {
+        engine->SetToplevelGeometry(crop_x, crop_y, crop_w, crop_h);
+      }
 
       wl_shm_buffer_begin_access(shm_buf);
       const auto* raw_data = static_cast<const uint8_t*>(wl_shm_buffer_get_data(shm_buf));
@@ -1075,6 +1082,8 @@ void SurfaceCommit(struct wl_client* /*client*/, struct wl_resource* resource) {
            frame.title.c_str(), frame.width, frame.height, frame.stride, frame.format,
            (crop_x || crop_y) ? " (cropped to window geometry)" : "");
 
+      surf->committed_width = frame.width;
+      surf->committed_height = frame.height;
       engine->PushCommittedFrame(std::move(frame));
       wl_buffer_send_release(buf_res);
     } else if (wl_resource_instance_of(buf_res, &wl_buffer_interface, &kDmaBufWlBufferImpl)) {
@@ -1103,6 +1112,8 @@ void SurfaceCommit(struct wl_client* /*client*/, struct wl_resource* resource) {
              frame.title.c_str(), frame.width, frame.height, frame.stride, frame.format,
              frame.dmabuf_fd);
 
+        surf->committed_width = frame.width;
+        surf->committed_height = frame.height;
         engine->PushCommittedFrame(std::move(frame));
       }
       wl_buffer_send_release(buf_res);
@@ -1651,6 +1662,8 @@ void XdgSurfaceGetToplevel(struct wl_client* client,
     wl_array_init(&states);
     auto* act = static_cast<uint32_t*>(wl_array_add(&states, sizeof(uint32_t)));
     if (act) *act = XDG_TOPLEVEL_STATE_ACTIVATED;
+    auto* max_st = static_cast<uint32_t*>(wl_array_add(&states, sizeof(uint32_t)));
+    if (max_st) *max_st = XDG_TOPLEVEL_STATE_MAXIMIZED;
 
     xdg_toplevel_send_configure(top_res,
                                 static_cast<int32_t>(surf->engine->config().display_width),
@@ -2102,6 +2115,16 @@ void WaylandServerEngine::AcceptBridgeClient(int listen_fd, const char* transpor
   if (client_fd < 0) return;
 
   LOGI(kTag, "Accepted %s guest bridge connection (fd=%d)", transport_name, client_fd);
+  if (config_.display_width > 0 && config_.display_height > 0) {
+    BridgeInputPacket init_pkt{};
+    init_pkt.magic = kBridgeInputMagic;
+    init_pkt.type = static_cast<uint32_t>(InputCommand::Type::kDisplayResize);
+    init_pkt.x = static_cast<double>(config_.display_width);
+    init_pkt.y = static_cast<double>(config_.display_height);
+    init_pkt.mods_latched = config_.display_width;
+    init_pkt.group = config_.display_height;
+    WriteAll(client_fd, &init_pkt, sizeof(init_pkt));
+  }
   auto bc = std::make_unique<BridgeClient>();
   bc->fd = client_fd;
   bc->engine = this;
@@ -2314,6 +2337,10 @@ void WaylandServerEngine::ForwardInputCommandToBridgeClients(const InputCommand&
   pkt.mods_latched = cmd.mods_latched;
   pkt.mods_locked = cmd.mods_locked;
   pkt.group = cmd.group;
+  if (cmd.type != InputCommand::Type::kKeyboardModifiers) {
+    pkt.mods_latched = config_.display_width;
+    pkt.group = config_.display_height;
+  }
 
   std::lock_guard<std::mutex> lock(bridge_clients_mutex_);
   for (auto& bc : bridge_clients_) {
@@ -2329,10 +2356,39 @@ bool WaylandServerEngine::ProcessBridgeInputFromHost(int sock_fd) {
     return false;
   }
   auto type = static_cast<InputCommand::Type>(pkt.type);
+  if (type != InputCommand::Type::kKeyboardModifiers &&
+      pkt.mods_latched > 0 && pkt.group > 0) {
+    uint32_t hw = pkt.mods_latched;
+    uint32_t hh = pkt.group;
+    if (hw != host_display_width_ || hh != host_display_height_) {
+      host_display_width_ = hw;
+      host_display_height_ = hh;
+      SetDisplaySize(hw, hh);
+    }
+  }
   switch (type) {
-    case InputCommand::Type::kPointerMotion:
-      SendPointerMotion(pkt.time_ms, pkt.x, pkt.y);
+    case InputCommand::Type::kPointerMotion: {
+      double mx = pkt.x;
+      double my = pkt.y;
+      uint32_t hw = host_display_width_.load();
+      uint32_t hh = host_display_height_.load();
+      uint32_t cw = last_crop_w_.load();
+      uint32_t ch = last_crop_h_.load();
+      uint32_t host_w = hw > 0 ? hw : config_.display_width;
+      uint32_t host_h = hh > 0 ? hh : config_.display_height;
+      uint32_t surf_w = cw > 0 ? cw : config_.display_width;
+      uint32_t surf_h = ch > 0 ? ch : config_.display_height;
+      if (host_w > 0 && surf_w > 0 && host_w != surf_w) {
+        mx = (mx * static_cast<double>(surf_w)) / static_cast<double>(host_w);
+      }
+      if (host_h > 0 && surf_h > 0 && host_h != surf_h) {
+        my = (my * static_cast<double>(surf_h)) / static_cast<double>(host_h);
+      }
+      mx += static_cast<double>(last_crop_x_.load());
+      my += static_cast<double>(last_crop_y_.load());
+      SendPointerMotion(pkt.time_ms, mx, my);
       break;
+    }
     case InputCommand::Type::kPointerButton:
       SendPointerButton(pkt.time_ms, pkt.button_or_key, pkt.state);
       break;
@@ -2345,9 +2401,17 @@ bool WaylandServerEngine::ProcessBridgeInputFromHost(int sock_fd) {
     case InputCommand::Type::kKeyboardModifiers:
       SendKeyboardModifiers(pkt.mods_depressed, pkt.mods_latched, pkt.mods_locked, pkt.group);
       break;
-    case InputCommand::Type::kDisplayResize:
-      SetDisplaySize(static_cast<uint32_t>(pkt.x), static_cast<uint32_t>(pkt.y));
+    case InputCommand::Type::kDisplayResize: {
+      uint32_t rw = static_cast<uint32_t>(pkt.x);
+      uint32_t rh = static_cast<uint32_t>(pkt.y);
+      if (rw > 0 && rh > 0) {
+        LOGI(kTag, "Received host display resize over bridge: %ux%u", rw, rh);
+        host_display_width_ = rw;
+        host_display_height_ = rh;
+        SetDisplaySize(rw, rh);
+      }
       break;
+    }
     default:
       break;
   }
@@ -2502,22 +2566,48 @@ void WaylandServerEngine::ProcessPendingInputCommands() {
           wl_array_init(&states);
           auto* act = static_cast<uint32_t*>(wl_array_add(&states, sizeof(uint32_t)));
           if (act) *act = XDG_TOPLEVEL_STATE_ACTIVATED;
+          auto* max_st = static_cast<uint32_t*>(wl_array_add(&states, sizeof(uint32_t)));
+          if (max_st) *max_st = XDG_TOPLEVEL_STATE_MAXIMIZED;
           xdg_toplevel_send_configure(entry.xdg_toplevel_res,
                                       static_cast<int32_t>(config_.display_width),
                                       static_cast<int32_t>(config_.display_height), &states);
           wl_array_release(&states);
-          xdg_surface_send_configure(entry.xdg_surface_res, NextSerial());
+          uint32_t serial = NextSerial();
+          xdg_surface_send_configure(entry.xdg_surface_res, serial);
+          LOGI(kTag, "Reconfigured toplevel surface to %ux%u (serial=%u)",
+               config_.display_width, config_.display_height, serial);
         }
       }
       continue;
+    }
+
+    if (cmd.type == InputCommand::Type::kPointerMotion) {
+      if ((pending_left_press_ || scroll_drag_active_) && last_motion_time_ms_ != 0 &&
+          cmd.time_ms > last_motion_time_ms_ && (cmd.time_ms - last_motion_time_ms_) > 350) {
+        // Auto-recover if an Android gesture ended with ACTION_CANCEL without sending ACTION_UP
+        pending_left_press_ = false;
+        scroll_drag_active_ = false;
+        pressed_buttons_mask_ = 0;
+      }
+      last_motion_time_ms_ = cmd.time_ms;
+      if (!pending_left_press_ && !scroll_drag_active_) {
+        double local_x = cmd.x;
+        double local_y = cmd.y;
+        struct wl_resource* target_surf = ResolvePointerTarget(cmd.x, cmd.y, &local_x, &local_y);
+        last_pointer_x_ = local_x;
+        last_pointer_y_ = local_y;
+        if (target_surf && target_surf != focused_surface_) {
+          SetFocusedSurface(target_surf);
+        }
+      }
     }
 
     if (focused_surface_ && !pointer_entered_ && !pointer_resources_.empty()) {
       uint32_t serial = NextSerial();
       for (auto* ptr : pointer_resources_) {
         if (wl_resource_get_client(ptr) != wl_resource_get_client(focused_surface_)) continue;
-        wl_pointer_send_enter(ptr, serial, focused_surface_, wl_fixed_from_double(cmd.x),
-                              wl_fixed_from_double(cmd.y));
+        wl_pointer_send_enter(ptr, serial, focused_surface_, wl_fixed_from_double(last_pointer_x_),
+                              wl_fixed_from_double(last_pointer_y_));
         if (wl_resource_get_version(ptr) >= WL_POINTER_FRAME_SINCE_VERSION) {
           wl_pointer_send_frame(ptr);
         }
@@ -2539,8 +2629,49 @@ void WaylandServerEngine::ProcessPendingInputCommands() {
 
     switch (cmd.type) {
       case InputCommand::Type::kPointerMotion: {
-        wl_fixed_t fx = wl_fixed_from_double(cmd.x);
-        wl_fixed_t fy = wl_fixed_from_double(cmd.y);
+        double local_x = cmd.x;
+        double local_y = cmd.y;
+        ResolvePointerTarget(cmd.x, cmd.y, &local_x, &local_y);
+        if (pending_left_press_) {
+          double total_dx = local_x - down_x_;
+          double total_dy = local_y - down_y_;
+          if (std::hypot(total_dx, total_dy) <= 8.0) {
+            break;
+          }
+          pending_left_press_ = false;
+          scroll_drag_active_ = true;
+          prev_scroll_x_ = down_x_;
+          prev_scroll_y_ = down_y_;
+        }
+        if (scroll_drag_active_) {
+          double step_dx = local_x - prev_scroll_x_;
+          double step_dy = local_y - prev_scroll_y_;
+          prev_scroll_x_ = local_x;
+          prev_scroll_y_ = local_y;
+          for (auto* ptr : pointer_resources_) {
+            if (focused_surface_ &&
+                wl_resource_get_client(ptr) != wl_resource_get_client(focused_surface_)) {
+              continue;
+            }
+            bool sent_axis = false;
+            if (std::abs(step_dy) >= 0.5) {
+              wl_pointer_send_axis(ptr, cmd.time_ms, WL_POINTER_AXIS_VERTICAL_SCROLL,
+                                   wl_fixed_from_double(-step_dy));
+              sent_axis = true;
+            }
+            if (std::abs(step_dx) >= 0.5) {
+              wl_pointer_send_axis(ptr, cmd.time_ms, WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+                                   wl_fixed_from_double(-step_dx));
+              sent_axis = true;
+            }
+            if (sent_axis && wl_resource_get_version(ptr) >= WL_POINTER_FRAME_SINCE_VERSION) {
+              wl_pointer_send_frame(ptr);
+            }
+          }
+          break;
+        }
+        wl_fixed_t fx = wl_fixed_from_double(local_x);
+        wl_fixed_t fy = wl_fixed_from_double(local_y);
         for (auto* ptr : pointer_resources_) {
           if (focused_surface_ &&
               wl_resource_get_client(ptr) != wl_resource_get_client(focused_surface_)) {
@@ -2554,12 +2685,73 @@ void WaylandServerEngine::ProcessPendingInputCommands() {
         break;
       }
       case InputCommand::Type::kPointerButton: {
+        uint32_t btn_bit = 1u << (cmd.button_or_key & 0x1fu);
+        if (cmd.state == WL_POINTER_BUTTON_STATE_PRESSED) {
+          if ((pressed_buttons_mask_ & btn_bit) &&
+              cmd.time_ms >= last_button_event_time_ms_ &&
+              (cmd.time_ms - last_button_event_time_ms_) < 50) {
+            break;
+          }
+          pressed_buttons_mask_ |= btn_bit;
+          last_button_event_time_ms_ = cmd.time_ms;
+          last_motion_time_ms_ = cmd.time_ms;
+          if (cmd.button_or_key == 0x110) {
+            pending_left_press_ = true;
+            scroll_drag_active_ = false;
+            down_time_ms_ = cmd.time_ms;
+            down_x_ = last_pointer_x_;
+            down_y_ = last_pointer_y_;
+            prev_scroll_x_ = last_pointer_x_;
+            prev_scroll_y_ = last_pointer_y_;
+            break;
+          }
+        } else {
+          if (!(pressed_buttons_mask_ & btn_bit)) {
+            break;
+          }
+          pressed_buttons_mask_ &= ~btn_bit;
+          last_button_event_time_ms_ = cmd.time_ms;
+          if (cmd.button_or_key == 0x110) {
+            if (pending_left_press_) {
+              pending_left_press_ = false;
+              wl_fixed_t fx = wl_fixed_from_double(down_x_);
+              wl_fixed_t fy = wl_fixed_from_double(down_y_);
+              uint32_t serial_down = NextSerial();
+              uint32_t serial_up = NextSerial();
+              for (auto* ptr : pointer_resources_) {
+                if (focused_surface_ &&
+                    wl_resource_get_client(ptr) != wl_resource_get_client(focused_surface_)) {
+                  continue;
+                }
+                wl_pointer_send_motion(ptr, down_time_ms_, fx, fy);
+                wl_pointer_send_button(ptr, serial_down, down_time_ms_, cmd.button_or_key,
+                                       WL_POINTER_BUTTON_STATE_PRESSED);
+                if (wl_resource_get_version(ptr) >= WL_POINTER_FRAME_SINCE_VERSION) {
+                  wl_pointer_send_frame(ptr);
+                }
+                wl_pointer_send_button(ptr, serial_up, cmd.time_ms, cmd.button_or_key,
+                                       WL_POINTER_BUTTON_STATE_RELEASED);
+                if (wl_resource_get_version(ptr) >= WL_POINTER_FRAME_SINCE_VERSION) {
+                  wl_pointer_send_frame(ptr);
+                }
+              }
+              break;
+            }
+            if (scroll_drag_active_) {
+              scroll_drag_active_ = false;
+              break;
+            }
+          }
+        }
         uint32_t serial = NextSerial();
+        wl_fixed_t fx = wl_fixed_from_double(last_pointer_x_);
+        wl_fixed_t fy = wl_fixed_from_double(last_pointer_y_);
         for (auto* ptr : pointer_resources_) {
           if (focused_surface_ &&
               wl_resource_get_client(ptr) != wl_resource_get_client(focused_surface_)) {
             continue;
           }
+          wl_pointer_send_motion(ptr, cmd.time_ms, fx, fy);
           wl_pointer_send_button(ptr, serial, cmd.time_ms, cmd.button_or_key, cmd.state);
           if (wl_resource_get_version(ptr) >= WL_POINTER_FRAME_SINCE_VERSION) {
             wl_pointer_send_frame(ptr);
@@ -2722,6 +2914,16 @@ void WaylandServerEngine::SetDisplaySize(uint32_t width, uint32_t height) {
   });
 }
 
+void WaylandServerEngine::SetToplevelGeometry(int32_t crop_x,
+                                              int32_t crop_y,
+                                              uint32_t crop_w,
+                                              uint32_t crop_h) {
+  last_crop_x_ = crop_x;
+  last_crop_y_ = crop_y;
+  if (crop_w > 0) last_crop_w_ = crop_w;
+  if (crop_h > 0) last_crop_h_ = crop_h;
+}
+
 uint32_t WaylandServerEngine::NextSerial() {
   return display_ ? wl_display_next_serial(display_) : 1;
 }
@@ -2731,7 +2933,9 @@ void WaylandServerEngine::RegisterClientPointer(struct wl_resource* pointer_res)
   if (focused_surface_ &&
       wl_resource_get_client(pointer_res) == wl_resource_get_client(focused_surface_)) {
     uint32_t serial = NextSerial();
-    wl_pointer_send_enter(pointer_res, serial, focused_surface_, 0, 0);
+    wl_pointer_send_enter(pointer_res, serial, focused_surface_,
+                          wl_fixed_from_double(last_pointer_x_),
+                          wl_fixed_from_double(last_pointer_y_));
     if (wl_resource_get_version(pointer_res) >= WL_POINTER_FRAME_SINCE_VERSION) {
       wl_pointer_send_frame(pointer_res);
     }
@@ -2834,8 +3038,87 @@ void WaylandServerEngine::OnSurfaceUnmappedOrDestroyed(struct wl_resource* surfa
   }
 }
 
+struct wl_resource* WaylandServerEngine::ResolvePointerTarget(double screen_x,
+                                                              double screen_y,
+                                                              double* out_local_x,
+                                                              double* out_local_y) const {
+  if (out_local_x) *out_local_x = screen_x;
+  if (out_local_y) *out_local_y = screen_y;
+
+  size_t mapped_count = 0;
+  struct wl_resource* base_surface = nullptr;
+  for (const auto& entry : toplevel_entries_) {
+    if (!entry.surface_res) continue;
+    auto* surf = static_cast<SurfaceState*>(wl_resource_get_user_data(entry.surface_res));
+    if (!surf || !surf->has_committed_buffer || surf->committed_width == 0 ||
+        surf->committed_height == 0) {
+      continue;
+    }
+    mapped_count++;
+    if (!base_surface ||
+        (surf->committed_width >= (config_.display_width * 3) / 4 &&
+         surf->committed_height >= (config_.display_height * 3) / 4)) {
+      base_surface = entry.surface_res;
+    }
+  }
+
+  if (mapped_count > 1) {
+    for (auto it = toplevel_entries_.rbegin(); it != toplevel_entries_.rend(); ++it) {
+      if (!it->surface_res) continue;
+      auto* surf = static_cast<SurfaceState*>(wl_resource_get_user_data(it->surface_res));
+      if (!surf || !surf->has_committed_buffer || surf->committed_width == 0 ||
+          surf->committed_height == 0) {
+        continue;
+      }
+      const bool is_dialog_size =
+          (surf->committed_width < (config_.display_width * 3) / 4 ||
+           surf->committed_height < (config_.display_height * 3) / 4);
+      if (!is_dialog_size) continue;
+
+      int32_t dx = (static_cast<int32_t>(config_.display_width) -
+                    static_cast<int32_t>(surf->committed_width)) /
+                   2;
+      int32_t dy = (static_cast<int32_t>(config_.display_height) -
+                    static_cast<int32_t>(surf->committed_height)) /
+                   2;
+      if (dx < 0) dx = 0;
+      if (dy < 0) dy = 0;
+
+      if (screen_x >= dx && screen_x < dx + static_cast<double>(surf->committed_width) &&
+          screen_y >= dy && screen_y < dy + static_cast<double>(surf->committed_height)) {
+        if (out_local_x) *out_local_x = screen_x - dx;
+        if (out_local_y) *out_local_y = screen_y - dy;
+        return it->surface_res;
+      }
+    }
+  }
+
+  return base_surface ? base_surface : focused_surface_;
+}
+
 void WaylandServerEngine::SetFocusedSurface(struct wl_resource* surface_res) {
   if (focused_surface_ == surface_res) return;
+
+  if (focused_surface_) {
+    if (pointer_entered_) {
+      uint32_t serial = NextSerial();
+      for (auto* ptr : pointer_resources_) {
+        if (wl_resource_get_client(ptr) != wl_resource_get_client(focused_surface_)) continue;
+        wl_pointer_send_leave(ptr, serial, focused_surface_);
+        if (wl_resource_get_version(ptr) >= WL_POINTER_FRAME_SINCE_VERSION) {
+          wl_pointer_send_frame(ptr);
+        }
+      }
+    }
+    if (keyboard_entered_) {
+      uint32_t serial = NextSerial();
+      for (auto* kbd : keyboard_resources_) {
+        if (wl_resource_get_client(kbd) != wl_resource_get_client(focused_surface_)) continue;
+        wl_keyboard_send_leave(kbd, serial, focused_surface_);
+      }
+    }
+  }
+
   focused_surface_ = surface_res;
   pointer_entered_ = false;
   keyboard_entered_ = false;
@@ -2844,7 +3127,9 @@ void WaylandServerEngine::SetFocusedSurface(struct wl_resource* surface_res) {
     uint32_t serial = NextSerial();
     for (auto* ptr : pointer_resources_) {
       if (wl_resource_get_client(ptr) != wl_resource_get_client(focused_surface_)) continue;
-      wl_pointer_send_enter(ptr, serial, focused_surface_, 0, 0);
+      wl_pointer_send_enter(ptr, serial, focused_surface_,
+                            wl_fixed_from_double(last_pointer_x_),
+                            wl_fixed_from_double(last_pointer_y_));
       if (wl_resource_get_version(ptr) >= WL_POINTER_FRAME_SINCE_VERSION) {
         wl_pointer_send_frame(ptr);
       }

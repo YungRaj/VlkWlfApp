@@ -14,7 +14,7 @@
 #            is busy (adbd uses it when wireless debugging is on) — check logcat for
 #            "Bound TCP Wayland Bridge listener on 0.0.0.0:<port>".
 set -euo pipefail
-HOST="${VKWLF_HOST_IP:-}"; PORT="${VKWLF_PORT:-5555}"; SIZE="${VKWLF_SIZE:-1600x900}"
+HOST="${VKWLF_HOST_IP:-}"; PORT="${VKWLF_PORT:-}"; SIZE="${VKWLF_SIZE:-1600x900}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --host) HOST="$2"; shift 2;;
@@ -28,6 +28,12 @@ done
 [[ $# -gt 0 ]] || { echo "usage: vkwlf-run [--host IP] [--port N] -- <app> [args]" >&2; exit 2; }
 [[ -n "$HOST" ]] || HOST="$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}')"
 [[ -n "$HOST" ]] || { echo "cannot determine host IP; pass --host" >&2; exit 1; }
+if [[ -z "$PORT" ]]; then
+  PORT=5555
+  if ! timeout 0.5 bash -c "</dev/tcp/$HOST/5555" 2>/dev/null && timeout 0.5 bash -c "</dev/tcp/$HOST/5556" 2>/dev/null; then
+    PORT=5556
+  fi
+fi
 PROXY="${VKWLF_GUEST_PROXY:-$(command -v vkwlf_guest_proxy || echo "$(dirname "$0")/vkwlf_guest_proxy")}"
 [[ -x "$PROXY" ]] || { echo "vkwlf_guest_proxy not found (set VKWLF_GUEST_PROXY)" >&2; exit 1; }
 
@@ -35,20 +41,46 @@ RT="/tmp/vkwlf-xdg-$(id -u)"; mkdir -p "$RT"; chmod 700 "$RT"
 SOCK="$RT/wayland-0"; rm -f "$SOCK" "$SOCK.lock"
 W="${SIZE%x*}"; H="${SIZE#*x}"
 
-echo "vkwlf-run: proxy -> $HOST:$PORT, display $SOCK (${W}x${H})"
-"$PROXY" --socket "$SOCK" --host-ip "$HOST" --tcp-port "$PORT" --vsock-port 0 \
-         --width "$W" --height "$H" > "$RT/proxy.log" 2>&1 &
-PROXY_PID=$!
-trap 'kill $PROXY_PID 2>/dev/null || true' EXIT
-for _ in $(seq 1 50); do
-  [[ -S "$SOCK" ]] && break
-  kill -0 "$PROXY_PID" 2>/dev/null || { echo "proxy exited:"; tail -5 "$RT/proxy.log"; exit 1; }
-  sleep 0.1
-done
-[[ -S "$SOCK" ]] || { echo "proxy did not create $SOCK"; tail -5 "$RT/proxy.log"; exit 1; }
+if timeout 0.5 bash -c "</dev/tcp/$HOST/$PORT" 2>/dev/null; then
+  echo "vkwlf-run: proxy -> $HOST:$PORT, display $SOCK (${W}x${H})"
+  "$PROXY" --socket "$SOCK" --host-ip "$HOST" --tcp-port "$PORT" --vsock-port 0 \
+           --width "$W" --height "$H" > "$RT/proxy.log" 2>&1 &
+  PROXY_PID=$!
+  trap 'kill $PROXY_PID 2>/dev/null || true' EXIT
+  for _ in $(seq 1 50); do
+    [[ -S "$SOCK" ]] && break
+    kill -0 "$PROXY_PID" 2>/dev/null || { echo "proxy exited:"; tail -5 "$RT/proxy.log"; exit 1; }
+    sleep 0.1
+  done
+  [[ -S "$SOCK" ]] || { echo "proxy did not create $SOCK"; tail -5 "$RT/proxy.log"; exit 1; }
+  export XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY="wayland-0"
+elif [[ -S "/run/user/$(id -u)/wayland-0" ]]; then
+  echo "vkwlf-run: host VkWlfApp ($HOST:$PORT) not reachable; using Terminal VM Wayland display (/run/user/$(id -u)/wayland-0)"
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)" WAYLAND_DISPLAY="wayland-0"
+else
+  echo "vkwlf-run: proxy -> $HOST:$PORT, display $SOCK (${W}x${H})"
+  "$PROXY" --socket "$SOCK" --host-ip "$HOST" --tcp-port "$PORT" --vsock-port 0 \
+           --width "$W" --height "$H" > "$RT/proxy.log" 2>&1 &
+  PROXY_PID=$!
+  trap 'kill $PROXY_PID 2>/dev/null || true' EXIT
+  for _ in $(seq 1 50); do
+    [[ -S "$SOCK" ]] && break
+    kill -0 "$PROXY_PID" 2>/dev/null || { echo "proxy exited:"; tail -5 "$RT/proxy.log"; exit 1; }
+    sleep 0.1
+  done
+  [[ -S "$SOCK" ]] || { echo "proxy did not create $SOCK"; tail -5 "$RT/proxy.log"; exit 1; }
+  export XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY="wayland-0"
+fi
 
-export XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY="wayland-0" GDK_BACKEND=wayland QT_QPA_PLATFORM=wayland \
-       MOZ_ENABLE_WAYLAND=1 ELECTRON_OZONE_PLATFORM_HINT=wayland
+unset DISPLAY
+export GDK_BACKEND=wayland QT_QPA_PLATFORM=wayland \
+       MOZ_ENABLE_WAYLAND=1 ELECTRON_OZONE_PLATFORM_HINT=wayland \
+       NODE_TLS_REJECT_UNAUTHORIZED=0 \
+       VKWLF_SESSION_ID="$$"
 "$@" &
 APP_PID=$!
-wait "$APP_PID"
+wait "$APP_PID" || true
+sleep 0.5
+while pgrep -f "/usr/share/antigravity/antigravity" >/dev/null 2>&1 && grep -slz "^VKWLF_SESSION_ID=$$$" /proc/[0-9]*/environ >/dev/null 2>&1; do
+  sleep 1
+done
