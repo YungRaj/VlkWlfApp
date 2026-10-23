@@ -12,8 +12,11 @@
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include "log_macros.h"
 #include "vk_renderer.h"
@@ -96,12 +99,16 @@ int ConnectToHostCompositor(unsigned int vsock_cid,
     }
   }
   if (tcp_port > 0 && !host_ip.empty()) {
-    int fd = ConnectTcp(host_ip, tcp_port);
-    if (fd >= 0) return fd;
+    for (uint16_t try_port : {tcp_port, static_cast<uint16_t>(tcp_port + 1)}) {
+      int fd = ConnectTcp(host_ip, try_port);
+      if (fd >= 0) return fd;
+    }
   }
   if (tcp_port > 0 && host_ip != "127.0.0.1") {
-    int fd = ConnectTcp("127.0.0.1", tcp_port);
-    if (fd >= 0) return fd;
+    for (uint16_t try_port : {tcp_port, static_cast<uint16_t>(tcp_port + 1)}) {
+      int fd = ConnectTcp("127.0.0.1", try_port);
+      if (fd >= 0) return fd;
+    }
   }
   return -1;
 }
@@ -257,8 +264,51 @@ int main(int argc, char** argv) {
 
   int host_fd = -1;
   uint64_t forwarded_frames = 0;
-  vkwlf::CommittedFrame last_toplevel_frame;
-  bool has_last_toplevel = false;
+  std::map<uint32_t, vkwlf::CommittedFrame> last_toplevel_frames;
+  std::unordered_map<uint32_t, std::vector<uint8_t>> surface_icons;
+
+  auto CacheToplevelFrame = [&](vkwlf::CommittedFrame&& f) {
+    if (!f.icon_png.empty()) {
+      surface_icons[f.surface_id] = f.icon_png;
+    } else {
+      auto icon_it = surface_icons.find(f.surface_id);
+      if (icon_it != surface_icons.end()) {
+        f.icon_png = icon_it->second;
+      }
+    }
+    if (f.is_unmapped) {
+      auto it = last_toplevel_frames.find(f.surface_id);
+      if (it != last_toplevel_frames.end()) {
+        if (it->second.dmabuf_fd >= 0) close(it->second.dmabuf_fd);
+        for (auto& p : it->second.planes) {
+          if (p.fd >= 0) close(p.fd);
+        }
+        last_toplevel_frames.erase(it);
+      }
+      if (f.dmabuf_fd >= 0) close(f.dmabuf_fd);
+      for (auto& p : f.planes) {
+        if (p.fd >= 0) close(p.fd);
+      }
+      return;
+    }
+    if (!f.is_popup && !f.is_subsurface &&
+        (!f.shm_pixels.empty() || f.dmabuf_fd >= 0) &&
+        f.parent_surface_id == 0 && f.width >= 320 && f.height >= 240) {
+      auto it = last_toplevel_frames.find(f.surface_id);
+      if (it != last_toplevel_frames.end()) {
+        if (it->second.dmabuf_fd >= 0) close(it->second.dmabuf_fd);
+        for (auto& p : it->second.planes) {
+          if (p.fd >= 0) close(p.fd);
+        }
+      }
+      last_toplevel_frames[f.surface_id] = std::move(f);
+    } else {
+      if (f.dmabuf_fd >= 0) close(f.dmabuf_fd);
+      for (auto& p : f.planes) {
+        if (p.fd >= 0) close(p.fd);
+      }
+    }
+  };
 
   if (max_frames > 0) {
     host_fd = ConnectToHostCompositor(vsock_cid, vsock_port, host_ip, tcp_port);
@@ -276,25 +326,11 @@ int main(int argc, char** argv) {
   while (g_running.load()) {
     if (host_fd < 0) {
       // Drain any frames produced while disconnected so the queue stays fresh,
-      // keeping the latest toplevel frame cached for instant display on connect.
+      // keeping the latest toplevel frame per app cached for instant display on connect.
       vkwlf::CommittedFrame pending;
       while (guest_server.PopCommittedFrame(&pending, 0)) {
         EnqueueGuestVulkanFrame(pending);
-        if (!pending.is_popup && !pending.is_subsurface && !pending.is_unmapped &&
-            (!pending.shm_pixels.empty() || pending.dmabuf_fd >= 0) &&
-            pending.parent_surface_id == 0 && pending.width >= (width * 3) / 4) {
-          if (last_toplevel_frame.dmabuf_fd >= 0) close(last_toplevel_frame.dmabuf_fd);
-          for (auto& p : last_toplevel_frame.planes) {
-            if (p.fd >= 0) close(p.fd);
-          }
-          last_toplevel_frame = std::move(pending);
-          has_last_toplevel = true;
-        } else {
-          if (pending.dmabuf_fd >= 0) close(pending.dmabuf_fd);
-          for (auto& p : pending.planes) {
-            if (p.fd >= 0) close(p.fd);
-          }
-        }
+        CacheToplevelFrame(std::move(pending));
       }
 
       host_fd = ConnectToHostCompositor(vsock_cid, vsock_port, host_ip, tcp_port);
@@ -303,8 +339,9 @@ int main(int argc, char** argv) {
         continue;
       }
 
-      if (has_last_toplevel) {
-        vkwlf::WaylandServerEngine::SendFrameOverBridgeSocket(host_fd, last_toplevel_frame);
+      for (const auto& [sid, cached_frame] : last_toplevel_frames) {
+        (void)sid;
+        vkwlf::WaylandServerEngine::SendFrameOverBridgeSocket(host_fd, cached_frame);
       }
     }
 
@@ -321,23 +358,15 @@ int main(int argc, char** argv) {
     while (g_running.load() && conn_alive.load()) {
       vkwlf::CommittedFrame frame;
       if (guest_server.PopCommittedFrame(&frame, 16)) {
-        bool sent = vkwlf::WaylandServerEngine::SendFrameOverBridgeSocket(host_fd, frame);
-        EnqueueGuestVulkanFrame(frame);
-        if (!frame.is_popup && !frame.is_subsurface && !frame.is_unmapped &&
-            (!frame.shm_pixels.empty() || frame.dmabuf_fd >= 0) &&
-            frame.parent_surface_id == 0 && frame.width >= (width * 3) / 4) {
-          if (last_toplevel_frame.dmabuf_fd >= 0) close(last_toplevel_frame.dmabuf_fd);
-          for (auto& p : last_toplevel_frame.planes) {
-            if (p.fd >= 0) close(p.fd);
-          }
-          last_toplevel_frame = std::move(frame);
-          has_last_toplevel = true;
-        } else {
-          if (frame.dmabuf_fd >= 0) close(frame.dmabuf_fd);
-          for (auto& p : frame.planes) {
-            if (p.fd >= 0) close(p.fd);
+        if (frame.icon_png.empty()) {
+          auto icon_it = surface_icons.find(frame.surface_id);
+          if (icon_it != surface_icons.end()) {
+            frame.icon_png = icon_it->second;
           }
         }
+        bool sent = vkwlf::WaylandServerEngine::SendFrameOverBridgeSocket(host_fd, frame);
+        EnqueueGuestVulkanFrame(frame);
+        CacheToplevelFrame(std::move(frame));
         if (!sent) {
           LOGI(kTag, "Host VkWlfCompositor disconnected; waiting for reconnect...");
           conn_alive.store(false);
@@ -386,9 +415,12 @@ int main(int argc, char** argv) {
     }
     guest_renderer.Shutdown();
   }
-  if (last_toplevel_frame.dmabuf_fd >= 0) close(last_toplevel_frame.dmabuf_fd);
-  for (auto& p : last_toplevel_frame.planes) {
-    if (p.fd >= 0) close(p.fd);
+  for (auto& [sid, cached_frame] : last_toplevel_frames) {
+    (void)sid;
+    if (cached_frame.dmabuf_fd >= 0) close(cached_frame.dmabuf_fd);
+    for (auto& p : cached_frame.planes) {
+      if (p.fd >= 0) close(p.fd);
+    }
   }
   guest_server.Stop();
   LOGI(kTag, "AVF Guest Wayland Proxy exited cleanly (forwarded_frames=%llu)",
