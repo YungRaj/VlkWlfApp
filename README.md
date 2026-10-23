@@ -174,6 +174,31 @@ pointer clicks, and `xdg_popup` menus (File menu).
 3. **Phase 3 (VM-to-Host Bridge)**: `vkwlf_guest_proxy` streams `BufferType::kDmaBuf` frames over the bridge socket.
 4. **Phase 4 (Android Host Hardware GPU Compositor)**: `VkWlfApp` imports each frame into a persistent hardware `AHardwareBuffer` (`VK_ANDROID_external_memory_android_hardware_buffer`, `shm_uploads=0`) and presents via `VkSwapchainKHR` on the host GPU.
 
+### Support Matrix: Unrooted `user` Builds vs. Rooted (Magisk) / `userdebug` Builds
+
+| Capability | Unrooted Production (`user`) Build (`ro.debuggable=0`) | Rooted (`Magisk su`) or `userdebug` Build |
+|---|---|---|
+| **Wayland `zwp_linux_dmabuf_v1` v4 (`shm_uploads=0`)** | **Supported & Active** (`/dev/dri/renderD128` + `dri_gbm.so` + `/dev/udmabuf`) | **Supported & Active** |
+| **Guest Vulkan DMA-BUF Import (`vkwlf_guest_proxy`)** | **Supported & Active** (`VK_EXT_external_memory_host` / `VK_KHR_external_memory_fd`) | **Supported & Active** |
+| **Android Host Hardware GPU Composition (`VkWlfApp`)** | **Supported & Active** (`AHardwareBuffer` + `vkQueuePresentKHR` on host iGPU) | **Supported & Active** |
+| **Guest `virtio-gpu` PCI (`0000:00:01.0`) Mode** | **2D Mode (`number of cap sets: 0`, `-virgl -context_init`)** — guest Vulkan uses `llvmpipe` (`lvp_icd.json`) | **3D `Gfxstream` Mode (`+context_init`, `gfxstream-vulkan:gfxstream-composer`)** — guest Vulkan uses `gfxstream_vk_icd.json` + Zink |
+
+#### Why Unrooted Production (`user`) Builds Boot `virtio-gpu` with `0` Capsets
+
+On production GoogleBook OS / Android Desktop builds (e.g. `Lenovo_Googlebook_15` / `ruby`, `ro.build.type=user`, `ro.debuggable=0`), `virtmgr` launches `crosvm_debian` with:
+```text
+--android-display-service=cid:2052 --gpu=egl=true,gles=true,surfaceless=true,displays=[[mode=windowed[1280,720],dpi=[160,160],refresh-rate=60]]
+```
+Inspecting `VmTerminalAppGoogle.apk` (`com.android.virtualization.terminal`) shows why `backend=gfxstream` is not passed on an unrooted `user` build:
+
+1. **`bool/gfxstream_supported` (`0x7f040006`) is `false` in the APK**:
+   - `VmTerminalAppGoogle.apk` defines `resource 0x7f040006 bool/gfxstream_supported OVERLAYABLE () false` under `<overlayable name="TerminalConfig" policies="product|system|vendor">`.
+   - The stock `/product/overlay/TerminalAppDesktopOverlay/TerminalAppDesktopOverlay.apk` only overrides `string/default_display_resolution`.
+   - Because `bool/gfxstream_supported` is `false`, `VmController.isGraphicsAccelerationSupported()` returns `false` (hiding the **Graphics Acceleration** toggle in Terminal Settings) and `GraphicsManager.getAccelerationType()` defaults to `AccelerationType.Lavapipe`.
+2. **Developer Overrides Require `Build.isDebuggable()` (`ro.debuggable=1`)**:
+   - Both the `/sdcard/linux/gfxstream` sentinel file check in `VmController.setGpuConfig()` and the `com.android.virtualization.terminal.EXTRA_CONFIG_PATH` intent extra in `MainViewModel.handleIntent()` check `Build.isDebuggable()` first and are ignored on `user` builds.
+   - `adb shell device_config put virtualization_framework_native terminal_gui_support true` is rejected by `SettingsProvider` (`SecurityException: must add flag to the allowlist`) on `user` builds and is superseded by `GraphicsManager` in current `VmTerminalAppGoogle` builds.
+
 ### Enabling `gfxstream_enabled=1` by Default Inside the Debian Terminal VM
 
 To configure the Debian Terminal VM so `gfxstream_enabled=1` is enabled by default in GRUB and all shell/systemd sessions prioritize `gfxstream_vk_icd.json` first (with automatic fallback to `lvp_icd.json` when the hypervisor launches `virtio-gpu` in 2D mode):
@@ -220,25 +245,40 @@ sudo install -m 755 build/vkwlf_compositor build/vkwlf_guest_proxy guest/vkwlf-a
 systemctl --user restart vkwlf-auto-bridge.service
 ```
 
-### Enabling the Host Gfxstream 3D Ring on Android (`com.android.virtualization.terminal`)
+### Enabling the Host Gfxstream 3D Ring on Android (Requires Root / Magisk `su` or `userdebug`)
 
-For the guest's `/dev/dri/renderD128` PCI device (`0000:00:01.0`) to expose host Gfxstream capability sets (`+context_init`, `number of cap sets > 0`), the Android host's `VmLauncherService` must start Crosvm with the `gfxstream` GPU backend:
+In `VmTerminalAppGoogle.apk`, when `GraphicsManager.getAccelerationType()` returns `AccelerationType.Gfxstream`, `VmController.setGpuConfig()` automatically configures `crosvm` with:
+- Kernel parameter: `gfxstream_enabled`
+- `backend = "gfxstream"`, `vulkan = true`, `surfaceless = true`
+- `contextTypes = ["gfxstream-vulkan", "gfxstream-composer"]`
+- `rendererFeatures = "VulkanDisableCoherentMemoryAndEmulate:enabled;VulkanAllocateHostVisibleAsUdmabuf:enabled;ExternalBlob:enabled"`
 
-- **Via ADB on the Android host**:
+Once the Android host is rooted (e.g. via **Magisk `su`**) or running a **`userdebug`** build, you can enable `Gfxstream` on the host using any of the following methods:
+
+- **Option A — Fabricate an RRO Overlay for `bool/gfxstream_supported` (Root / Magisk `su`)**:
+  Overrides `0x7f040006` (`bool/gfxstream_supported`) to `true`, which both enables `Gfxstream` by default and unlocks the **Graphics Acceleration** selector in the Terminal app's Settings UI:
   ```bash
-  adb shell device_config put virtualization_framework_native terminal_gui_support true
+  adb shell su -c "cmd overlay fabricate --target com.android.virtualization.terminal --name EnableGfxstream com.android.virtualization.terminal:bool/gfxstream_supported 0x12 0xffffffff && cmd overlay enable --user all com.android.shell:EnableGfxstream"
   adb shell am force-stop com.android.virtualization.terminal
   ```
-- **On `userdebug` / rooted Android builds (`vm_config.json`)**:
-  Set the `"gpu"` block in the Terminal VM's `vm_config.json` and restart the Terminal app:
-  ```json
-  "params": "... gfxstream_enabled",
-  "gpu": {
-    "backend": "gfxstream",
-    "vulkan": true,
-    "surfaceless": true,
-    "context-types": "gfxstream-vulkan:gfxstream-composer"
-  }
+- **Option B — Set `acceleration_type` in `com.android.virtualization.terminal.GRAPHICS.xml` (Root / Magisk `su`)**:
+  In `GraphicsManager.getAccelerationType()`, `sharedPref.getString("acceleration_type", null)` overrides `isGfxstreamSupported` even when `bool/gfxstream_supported` is `false`:
+  ```bash
+  adb shell su -c 'cat <<EOF > /data/user/10/com.android.virtualization.terminal/shared_prefs/com.android.virtualization.terminal.GRAPHICS.xml
+  <?xml version="1.0" encoding="utf-8" standalone="yes" ?>
+  <map>
+      <string name="acceleration_type">Gfxstream</string>
+  </map>
+  EOF
+  chown $(stat -c "%u:%g" /data/user/10/com.android.virtualization.terminal) /data/user/10/com.android.virtualization.terminal/shared_prefs/com.android.virtualization.terminal.GRAPHICS.xml
+  chmod 660 /data/user/10/com.android.virtualization.terminal/shared_prefs/com.android.virtualization.terminal.GRAPHICS.xml'
+  adb shell am force-stop com.android.virtualization.terminal
+  ```
+- **Option C — On `userdebug` Android Builds**:
+  Create the `/sdcard/linux/gfxstream` sentinel file checked by `VmController.setGpuConfig()` (or edit `vm_config.json`):
+  ```bash
+  adb shell mkdir -p /sdcard/linux && adb shell touch /sdcard/linux/gfxstream
+  adb shell am force-stop com.android.virtualization.terminal
   ```
 
 ### Verifying Zero-Copy DMA-BUF & Vulkan Composition
@@ -247,6 +287,10 @@ Check `/tmp/vkwlf-xdg-1000/proxy.log` inside the VM to confirm `shm_uploads=0` a
 
 ```bash
 grep -E "Created zero-copy|GuestVulkanGPU" /tmp/vkwlf-xdg-1000/proxy.log
+```
+And after enabling host `Gfxstream` via Root/Magisk, verify the 3D capability sets in the guest kernel log:
+```bash
+sudo dmesg | grep -E "features:|number of cap sets"
 ```
 
 ## 5. Troubleshooting
