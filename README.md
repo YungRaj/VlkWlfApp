@@ -16,6 +16,20 @@ desktop apps (Antigravity, an Electron IDE, is the reference workload) as native
   ([`src/vkwlf_guest_proxy.cpp`](src/vkwlf_guest_proxy.cpp)) for clients that
   run inside a VM
 
+## Screenshots (Antigravity IDE on VkWlfApp)
+
+Full **Antigravity IDE** workbench (`2382×1299`) running inside the Linux VM over the `vkwlf_guest_proxy` Wayland bridge, with the project explorer, C++ editor (`clangd`), integrated terminal, and AI Agent panel active:
+
+![Antigravity IDE running in VkWlfApp](docs/images/antigravity_ide_vkwlf.png)
+
+<details>
+<summary><b>Close-up: Right-side AI Agent Panel (Claude 5.5 / Gemini)</b></summary>
+<br>
+
+![Antigravity IDE Agent Panel](docs/images/antigravity_agent_panel.png)
+
+</details>
+
 ## Layout
 
 | Path | What |
@@ -25,6 +39,8 @@ desktop apps (Antigravity, an Electron IDE, is the reference workload) as native
 | `Android.bp`, `CMakeLists.txt` | Soong and CMake builds |
 | `tools/build_apk.sh` | reproducible APK build (NDK + aapt2/d8/apksigner) |
 | `guest/vkwlf-run` | in‑VM launcher: starts the proxy and runs a Wayland app against it |
+| `guest/vkwlf-auto-bridge` | persistent auto-bridge service script for launching Antigravity IDE |
+| `guest/vkwlf-cloudcode-proxy` | local Cloud Code model compatibility proxy for Antigravity IDE |
 | `guest/` (rest) | dev‑rig only: host daemon, IDE chroot launcher, `libnopkey.c` shim |
 | `tools/` (rest) | dev‑rig only: VM viewer launcher, VNC colour‑fix proxy, QEMU wrapper |
 | `tests/` | `weston-simple-shm`, a minimal Wayland client used as the smoke test |
