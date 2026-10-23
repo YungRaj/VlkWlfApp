@@ -16,15 +16,17 @@ desktop apps (Antigravity, an Electron IDE, is the reference workload) as native
   ([`src/vkwlf_guest_proxy.cpp`](src/vkwlf_guest_proxy.cpp)) for clients that
   run inside a VM
 
-## Screenshots (Antigravity IDE on VkWlfApp)
+## Screenshots (Antigravity IDE on GoogleBook OS / Android Desktop)
 
-Full **Antigravity IDE** workbench (`2382×1299`) running inside the Linux VM over the `vkwlf_guest_proxy` Wayland bridge, with the project explorer, C++ editor (`clangd`), integrated terminal, and AI Agent panel active:
+Full **GoogleBook OS / Android Desktop** environment showing **VkWlfApp** presenting the **Antigravity IDE** (`2382×1299` Wayland surface) as a native freeform desktop window with custom app icon/title caption bar (`MainActivity.java`), alongside the Linux Terminal VM in the dock:
 
-![Antigravity IDE running in VkWlfApp](docs/images/antigravity_ide_vkwlf.png)
+![Antigravity IDE running in VkWlfApp on GoogleBook OS](docs/images/googlebook_antigravity_desktop.png)
 
 <details>
-<summary><b>Close-up: Right-side AI Agent Panel (Claude 5.5 / Gemini)</b></summary>
+<summary><b>Raw Wayland Toplevel Surface & Right-side AI Agent Panel (Claude 5.5 / Gemini)</b></summary>
 <br>
+
+![Antigravity IDE Wayland Surface](docs/images/antigravity_ide_vkwlf.png)
 
 ![Antigravity IDE Agent Panel](docs/images/antigravity_agent_panel.png)
 
