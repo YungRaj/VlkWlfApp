@@ -95,6 +95,8 @@ class VkRenderer {
     bool is_popup = false;
     bool is_subsurface = false;
     bool is_external_dmabuf = false;
+    void* external_host_ptr = nullptr;
+    size_t external_host_size = 0;
     AHardwareBuffer* persistent_ahb = nullptr;
     void* persistent_ahb_vaddr = nullptr;
     uint32_t persistent_ahb_stride = 0;
@@ -143,6 +145,7 @@ class VkRenderer {
   bool use_swapchain_ = false;
   bool has_external_memory_fd_ = false;
   bool has_dma_buf_ext_ = false;
+  bool has_external_memory_host_ = false;
   bool has_android_ahb_ext_ = false;
 
   VkInstance instance_ = VK_NULL_HANDLE;

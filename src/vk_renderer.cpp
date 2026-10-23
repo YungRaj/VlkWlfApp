@@ -307,20 +307,28 @@ bool VkRenderer::PickPhysicalDevice() {
   std::vector<VkPhysicalDevice> devices(dev_count);
   vkEnumeratePhysicalDevices(instance_, &dev_count, devices.data());
 
-  for (VkPhysicalDevice dev : devices) {
-    uint32_t q_count = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(dev, &q_count, nullptr);
-    std::vector<VkQueueFamilyProperties> q_props(q_count);
-    vkGetPhysicalDeviceQueueFamilyProperties(dev, &q_count, q_props.data());
-
-    for (uint32_t i = 0; i < q_count; ++i) {
-      if (q_props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-        physical_device_ = dev;
-        graphics_queue_family_ = i;
-        break;
+  for (int pass = 0; pass < 2 && physical_device_ == VK_NULL_HANDLE; ++pass) {
+    for (VkPhysicalDevice dev : devices) {
+      VkPhysicalDeviceProperties dev_props{};
+      vkGetPhysicalDeviceProperties(dev, &dev_props);
+      // Pass 0: prefer hardware/virtual GPUs (Intel Xe, Gfxstream, Virtio-GPU Venus) over CPU ICDs.
+      if (pass == 0 && dev_props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+        continue;
       }
+      uint32_t q_count = 0;
+      vkGetPhysicalDeviceQueueFamilyProperties(dev, &q_count, nullptr);
+      std::vector<VkQueueFamilyProperties> q_props(q_count);
+      vkGetPhysicalDeviceQueueFamilyProperties(dev, &q_count, q_props.data());
+
+      for (uint32_t i = 0; i < q_count; ++i) {
+        if (q_props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
+          physical_device_ = dev;
+          graphics_queue_family_ = i;
+          break;
+        }
+      }
+      if (physical_device_ != VK_NULL_HANDLE) break;
     }
-    if (physical_device_ != VK_NULL_HANDLE) break;
   }
 
   if (physical_device_ == VK_NULL_HANDLE) {
@@ -357,6 +365,10 @@ bool VkRenderer::CreateLogicalDevice() {
   if (HasExtension(avail_exts, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)) {
     enabled_exts.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
     has_dma_buf_ext_ = true;
+  }
+  if (HasExtension(avail_exts, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+    enabled_exts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    has_external_memory_host_ = true;
   }
   if (HasExtension(avail_exts, VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME)) {
     enabled_exts.push_back(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
@@ -1031,6 +1043,11 @@ void VkRenderer::DestroySurfaceTexture(SurfaceTexture* tex) {
     vkFreeMemory(device_, tex->memory, nullptr);
     tex->memory = VK_NULL_HANDLE;
   }
+  if (tex->external_host_ptr != nullptr && tex->external_host_ptr != MAP_FAILED) {
+    munmap(tex->external_host_ptr, tex->external_host_size);
+    tex->external_host_ptr = nullptr;
+    tex->external_host_size = 0;
+  }
 #ifdef __ANDROID__
   if (tex->persistent_ahb != nullptr) {
     if (tex->persistent_ahb_vaddr != nullptr) {
@@ -1479,85 +1496,162 @@ bool VkRenderer::ImportDmaBufToTexture(const CommittedFrame& frame, SurfaceTextu
   }
 #endif
 
-  if (has_external_memory_fd_) {
+  if (has_external_memory_fd_ || has_external_memory_host_) {
     DestroySurfaceTexture(tex);
     tex->width = frame.width;
     tex->height = frame.height;
-    tex->format = VK_FORMAT_B8G8R8A8_UNORM;
+    const bool is_rgba_fourcc =
+        (frame.format == 0x34324241u || frame.format == 0x34324258u);
+    const bool force_opaque =
+        (frame.format == WL_SHM_FORMAT_XRGB8888 || frame.format == 0x34325258u ||
+         frame.format == 0x34324258u);
+    tex->format = is_rgba_fourcc ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_B8G8R8A8_UNORM;
     tex->is_external_dmabuf = true;
 
-    VkExternalMemoryHandleTypeFlagBits handle_type =
+    const uint32_t plane_offset = frame.planes.empty() ? 0u : frame.planes[0].offset;
+    const bool tight_stride = (frame.stride == frame.width * 4 && plane_offset == 0);
+
+    VkExternalMemoryHandleTypeFlagBits fd_handle_type =
         has_dma_buf_ext_ ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
                          : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
 
-    VkExternalMemoryImageCreateInfo ext_img_info{};
-    ext_img_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-    ext_img_info.handleTypes = handle_type;
+    // Path A: Direct linear VkImage zero-copy import (when row pitch matches width * 4).
+    if (tight_stride) {
+      VkExternalMemoryImageCreateInfo ext_img_info{};
+      ext_img_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+      ext_img_info.handleTypes =
+          (has_external_memory_fd_ ? static_cast<VkExternalMemoryHandleTypeFlags>(fd_handle_type)
+                                   : 0u) |
+          (has_external_memory_host_
+               ? static_cast<VkExternalMemoryHandleTypeFlags>(
+                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT)
+               : 0u);
 
-    VkImageCreateInfo img_info{};
-    img_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    img_info.pNext = &ext_img_info;
-    img_info.imageType = VK_IMAGE_TYPE_2D;
-    img_info.format = tex->format;
-    img_info.extent = {frame.width, frame.height, 1};
-    img_info.mipLevels = 1;
-    img_info.arrayLayers = 1;
-    img_info.samples = VK_SAMPLE_COUNT_1_BIT;
-    img_info.tiling = VK_IMAGE_TILING_LINEAR;
-    img_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    img_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    img_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      VkImageCreateInfo img_info{};
+      img_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+      img_info.pNext = &ext_img_info;
+      img_info.imageType = VK_IMAGE_TYPE_2D;
+      img_info.format = tex->format;
+      img_info.extent = {frame.width, frame.height, 1};
+      img_info.mipLevels = 1;
+      img_info.arrayLayers = 1;
+      img_info.samples = VK_SAMPLE_COUNT_1_BIT;
+      img_info.tiling = VK_IMAGE_TILING_LINEAR;
+      img_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      img_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+      img_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    if (vkCreateImage(device_, &img_info, nullptr, &tex->image) == VK_SUCCESS) {
-      VkMemoryRequirements reqs{};
-      vkGetImageMemoryRequirements(device_, tex->image, &reqs);
+      if (vkCreateImage(device_, &img_info, nullptr, &tex->image) == VK_SUCCESS) {
+        VkImageSubresource subres{};
+        subres.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        subres.mipLevel = 0;
+        subres.arrayLayer = 0;
+        VkSubresourceLayout subres_layout{};
+        vkGetImageSubresourceLayout(device_, tex->image, &subres, &subres_layout);
 
-      uint32_t mem_type_bits = reqs.memoryTypeBits;
-      auto fpGetMemoryFdPropertiesKHR = reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
-          vkGetDeviceProcAddr(device_, "vkGetMemoryFdPropertiesKHR"));
-      if (fpGetMemoryFdPropertiesKHR &&
-          handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
-        VkMemoryFdPropertiesKHR fd_props{};
-        fd_props.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
-        if (fpGetMemoryFdPropertiesKHR(device_, handle_type, frame.dmabuf_fd, &fd_props) ==
-            VK_SUCCESS) {
-          mem_type_bits &= fd_props.memoryTypeBits;
+        VkMemoryRequirements reqs{};
+        vkGetImageMemoryRequirements(device_, tex->image, &reqs);
+
+        bool bound_ok = false;
+        const char* import_mechanism = "VK_KHR_external_memory_fd";
+
+        if (subres_layout.rowPitch == frame.stride && has_external_memory_fd_) {
+          uint32_t mem_type_bits = reqs.memoryTypeBits;
+          auto fpGetMemoryFdPropertiesKHR = reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
+              vkGetDeviceProcAddr(device_, "vkGetMemoryFdPropertiesKHR"));
+          if (fpGetMemoryFdPropertiesKHR &&
+              fd_handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
+            VkMemoryFdPropertiesKHR fd_props{};
+            fd_props.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+            if (fpGetMemoryFdPropertiesKHR(device_, fd_handle_type, frame.dmabuf_fd, &fd_props) ==
+                VK_SUCCESS) {
+              mem_type_bits &= fd_props.memoryTypeBits;
+            }
+          }
+
+          int imported_fd = dup(frame.dmabuf_fd);
+          if (imported_fd >= 0) {
+            VkMemoryDedicatedAllocateInfo dedicated_info{};
+            dedicated_info.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+            dedicated_info.image = tex->image;
+
+            VkImportMemoryFdInfoKHR import_info{};
+            import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+            import_info.pNext = &dedicated_info;
+            import_info.handleType = fd_handle_type;
+            import_info.fd = imported_fd;
+
+            VkMemoryAllocateInfo alloc_info{};
+            alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            alloc_info.pNext = &import_info;
+            alloc_info.allocationSize = reqs.size;
+            alloc_info.memoryTypeIndex = FindMemoryType(mem_type_bits, 0);
+
+            VkResult alloc_res = vkAllocateMemory(device_, &alloc_info, nullptr, &tex->memory);
+            if (alloc_res != VK_SUCCESS &&
+                fd_handle_type != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
+              import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+              alloc_res = vkAllocateMemory(device_, &alloc_info, nullptr, &tex->memory);
+            }
+            if (alloc_res == VK_SUCCESS &&
+                vkBindImageMemory(device_, tex->image, tex->memory, 0) == VK_SUCCESS) {
+              bound_ok = true;
+            } else {
+              if (alloc_res != VK_SUCCESS) {
+                close(imported_fd);
+              }
+              if (tex->memory != VK_NULL_HANDLE) {
+                vkFreeMemory(device_, tex->memory, nullptr);
+                tex->memory = VK_NULL_HANDLE;
+              }
+            }
+          }
         }
-      }
 
-      int imported_fd = dup(frame.dmabuf_fd);
-      if (imported_fd >= 0) {
-        VkMemoryDedicatedAllocateInfo dedicated_info{};
-        dedicated_info.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
-        dedicated_info.image = tex->image;
+        // If client exported a read-only DRM PRIME DMA-BUF FD (e.g. Mesa gbm_bo_get_fd without
+        // DRM_RDWR), map it PROT_READ and import zero-copy via VK_EXT_external_memory_host.
+        if (!bound_ok && subres_layout.rowPitch == frame.stride && has_external_memory_host_) {
+          size_t map_len =
+              std::max<size_t>(reqs.size, static_cast<size_t>(frame.stride) * frame.height);
+          void* host_ptr = mmap(nullptr, map_len, PROT_READ, MAP_SHARED, frame.dmabuf_fd, 0);
+          if (host_ptr != MAP_FAILED) {
+            VkImportMemoryHostPointerInfoEXT host_import{};
+            host_import.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+            host_import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            host_import.pHostPointer = host_ptr;
 
-        VkImportMemoryFdInfoKHR import_info{};
-        import_info.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
-        import_info.pNext = &dedicated_info;
-        import_info.handleType = handle_type;
-        import_info.fd = imported_fd;
+            VkMemoryAllocateInfo alloc_info{};
+            alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            alloc_info.pNext = &host_import;
+            alloc_info.allocationSize = reqs.size;
+            alloc_info.memoryTypeIndex =
+                FindMemoryType(reqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
 
-        VkMemoryAllocateInfo alloc_info{};
-        alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        alloc_info.pNext = &import_info;
-        alloc_info.allocationSize = reqs.size;
-        alloc_info.memoryTypeIndex = FindMemoryType(mem_type_bits, 0);
-
-        VkResult alloc_res = vkAllocateMemory(device_, &alloc_info, nullptr, &tex->memory);
-        if (alloc_res != VK_SUCCESS && handle_type != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT) {
-          // Retry with VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT if the client exported a
-          // Vulkan opaque FD over zwp_linux_dmabuf_v1.
-          import_info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-          alloc_res = vkAllocateMemory(device_, &alloc_info, nullptr, &tex->memory);
+            if (vkAllocateMemory(device_, &alloc_info, nullptr, &tex->memory) == VK_SUCCESS &&
+                vkBindImageMemory(device_, tex->image, tex->memory, 0) == VK_SUCCESS) {
+              tex->external_host_ptr = host_ptr;
+              tex->external_host_size = map_len;
+              bound_ok = true;
+              import_mechanism = "VK_EXT_external_memory_host[DMA-BUF]";
+            } else {
+              if (tex->memory != VK_NULL_HANDLE) {
+                vkFreeMemory(device_, tex->memory, nullptr);
+                tex->memory = VK_NULL_HANDLE;
+              }
+              munmap(host_ptr, map_len);
+            }
+          }
         }
 
-        if (alloc_res == VK_SUCCESS &&
-            vkBindImageMemory(device_, tex->image, tex->memory, 0) == VK_SUCCESS) {
+        if (bound_ok) {
           VkImageViewCreateInfo view_info{};
           view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
           view_info.image = tex->image;
           view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
           view_info.format = tex->format;
+          if (force_opaque) {
+            view_info.components.a = VK_COMPONENT_SWIZZLE_ONE;
+          }
           view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
           view_info.subresourceRange.levelCount = 1;
           view_info.subresourceRange.layerCount = 1;
@@ -1594,19 +1688,126 @@ bool VkRenderer::ImportDmaBufToTexture(const CommittedFrame& frame, SurfaceTextu
                 stats_.dmabuf_imports++;
               }
               LOGI(kTag,
-                   "Zero-copy imported DMA-BUF fd=%d into VkImage (%ux%u) via "
-                   "VK_KHR_external_memory_fd",
-                   frame.dmabuf_fd, frame.width, frame.height);
+                   "Zero-copy imported DMA-BUF fd=%d into VkImage (%ux%u, stride=%u) via %s",
+                   frame.dmabuf_fd, frame.width, frame.height, frame.stride, import_mechanism);
               return true;
             }
           }
-        } else {
-          // Note: On failed vkAllocateMemory, Vulkan does not consume imported_fd.
-          close(imported_fd);
         }
       }
+      DestroySurfaceTexture(tex);
     }
-    DestroySurfaceTexture(tex);
+
+    // Path B: Padded DRM row stride (e.g. 64-pixel aligned dumb buffers where stride != width * 4).
+    // Import the DMA-BUF directly into an external VkBuffer and GPU-blit with bufferRowLength = stride / 4.
+    if (has_external_memory_host_ && frame.stride >= frame.width * 4 && (frame.stride % 4 == 0)) {
+      const size_t total_plane_bytes =
+          static_cast<size_t>(plane_offset) + static_cast<size_t>(frame.stride) * frame.height;
+      const size_t aligned_bytes = (total_plane_bytes + 4095u) & ~static_cast<size_t>(4095u);
+      void* host_ptr = mmap(nullptr, total_plane_bytes, PROT_READ, MAP_SHARED, frame.dmabuf_fd, 0);
+      if (host_ptr != MAP_FAILED) {
+        VkExternalMemoryBufferCreateInfo ext_buf_info{};
+        ext_buf_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+        ext_buf_info.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+
+        VkBufferCreateInfo buf_info{};
+        buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        buf_info.pNext = &ext_buf_info;
+        buf_info.size = aligned_bytes;
+        buf_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        VkBuffer ext_buf = VK_NULL_HANDLE;
+        VkDeviceMemory ext_mem = VK_NULL_HANDLE;
+        if (vkCreateBuffer(device_, &buf_info, nullptr, &ext_buf) == VK_SUCCESS) {
+          VkMemoryRequirements buf_reqs{};
+          vkGetBufferMemoryRequirements(device_, ext_buf, &buf_reqs);
+
+          VkImportMemoryHostPointerInfoEXT host_import{};
+          host_import.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT;
+          host_import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+          host_import.pHostPointer = host_ptr;
+
+          VkMemoryAllocateInfo alloc_info{};
+          alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+          alloc_info.pNext = &host_import;
+          alloc_info.allocationSize = std::max<VkDeviceSize>(buf_reqs.size, aligned_bytes);
+          alloc_info.memoryTypeIndex =
+              FindMemoryType(buf_reqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+
+          if (vkAllocateMemory(device_, &alloc_info, nullptr, &ext_mem) == VK_SUCCESS &&
+              vkBindBufferMemory(device_, ext_buf, ext_mem, 0) == VK_SUCCESS &&
+              AllocateAndSetupTextureImage(tex, frame.width, frame.height, tex->format)) {
+            if (force_opaque && tex->view != VK_NULL_HANDLE) {
+              vkDestroyImageView(device_, tex->view, nullptr);
+              tex->view = VK_NULL_HANDLE;
+              VkImageViewCreateInfo view_info{};
+              view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+              view_info.image = tex->image;
+              view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+              view_info.format = tex->format;
+              view_info.components.a = VK_COMPONENT_SWIZZLE_ONE;
+              view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+              view_info.subresourceRange.levelCount = 1;
+              view_info.subresourceRange.layerCount = 1;
+              vkCreateImageView(device_, &view_info, nullptr, &tex->view);
+
+              VkDescriptorImageInfo desc_img{};
+              desc_img.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+              desc_img.imageView = tex->view;
+              desc_img.sampler = sampler_;
+              VkWriteDescriptorSet write_ds{};
+              write_ds.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              write_ds.dstSet = tex->descriptor_set;
+              write_ds.dstBinding = 0;
+              write_ds.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+              write_ds.descriptorCount = 1;
+              write_ds.pImageInfo = &desc_img;
+              vkUpdateDescriptorSets(device_, 1, &write_ds, 0, nullptr);
+            }
+
+            VkCommandBuffer cmd = BeginSingleTimeCommands();
+            TransitionImageLayout(cmd, tex->image, VK_IMAGE_LAYOUT_UNDEFINED,
+                                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+            VkBufferImageCopy region{};
+            region.bufferOffset = plane_offset;
+            region.bufferRowLength = frame.stride / 4;
+            region.bufferImageHeight = frame.height;
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.mipLevel = 0;
+            region.imageSubresource.baseArrayLayer = 0;
+            region.imageSubresource.layerCount = 1;
+            region.imageOffset = {0, 0, 0};
+            region.imageExtent = {frame.width, frame.height, 1};
+
+            vkCmdCopyBufferToImage(cmd, ext_buf, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   1, &region);
+
+            TransitionImageLayout(cmd, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            EndSingleTimeCommands(cmd);
+
+            vkDestroyBuffer(device_, ext_buf, nullptr);
+            vkFreeMemory(device_, ext_mem, nullptr);
+            munmap(host_ptr, total_plane_bytes);
+
+            {
+              std::lock_guard<std::mutex> lock(stats_mutex_);
+              stats_.dmabuf_imports++;
+            }
+            LOGI(kTag,
+                 "Imported padded DMA-BUF fd=%d (%ux%u, stride=%u) into VkImage via "
+                 "VK_EXT_external_memory_host",
+                 frame.dmabuf_fd, frame.width, frame.height, frame.stride);
+            return true;
+          }
+          if (ext_buf != VK_NULL_HANDLE) vkDestroyBuffer(device_, ext_buf, nullptr);
+          if (ext_mem != VK_NULL_HANDLE) vkFreeMemory(device_, ext_mem, nullptr);
+        }
+        munmap(host_ptr, total_plane_bytes);
+      }
+    }
   }
 
   // Fallback for non-DRM memfd descriptors on software ICDs: mmap the fd and upload via staging.
@@ -1915,7 +2116,12 @@ bool VkRenderer::RecordAndSubmitRenderPass(uint32_t image_index, const SurfaceTe
     VkBufferImageCopy copy_region{};
     copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     copy_region.imageSubresource.layerCount = 1;
-    if (use_swapchain_) {
+#ifdef __ANDROID__
+    const bool copy_single_center_pixel = use_swapchain_;
+#else
+    const bool copy_single_center_pixel = false;
+#endif
+    if (copy_single_center_pixel) {
       copy_region.imageOffset = {static_cast<int32_t>(swapchain_extent_.width / 2),
                                  static_cast<int32_t>(swapchain_extent_.height / 2), 0};
       copy_region.imageExtent = {1, 1, 1};
@@ -1970,14 +2176,19 @@ bool VkRenderer::RecordAndSubmitRenderPass(uint32_t image_index, const SurfaceTe
   if (readback_memory_ != VK_NULL_HANDLE) {
     uint32_t pixel = 0;
     void* ptr = nullptr;
+#ifdef __ANDROID__
+    const bool copy_single_center_pixel = use_swapchain_;
+#else
+    const bool copy_single_center_pixel = false;
+#endif
     VkDeviceSize map_bytes =
-        use_swapchain_
+        copy_single_center_pixel
             ? sizeof(uint32_t)
             : static_cast<VkDeviceSize>(swapchain_extent_.width) * swapchain_extent_.height * 4;
     if (vkMapMemory(device_, readback_memory_, 0, map_bytes, 0, &ptr) == VK_SUCCESS) {
       const auto* pixels = static_cast<const uint32_t*>(ptr);
       size_t center_idx =
-          use_swapchain_
+          copy_single_center_pixel
               ? 0u
               : static_cast<size_t>(swapchain_extent_.height / 2) * swapchain_extent_.width +
                     (swapchain_extent_.width / 2);

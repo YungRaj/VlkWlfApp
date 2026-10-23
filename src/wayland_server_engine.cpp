@@ -814,14 +814,100 @@ void DmaBufCreateParams(struct wl_client* client,
   wl_resource_set_implementation(params_res, &kDmaBufParamsImpl, state, OnDmaBufParamsDestroy);
 }
 
+const struct zwp_linux_dmabuf_feedback_v1_interface kDmaBufFeedbackImpl = {
+    .destroy = GenericResourceDestroy,
+};
+
+void SendDmaBufFeedbackEvents(struct wl_resource* fb_res) {
+  if (!fb_res) return;
+
+  struct stat st {};
+  dev_t main_dev = 0;
+  if (stat("/dev/dri/renderD128", &st) == 0 && st.st_rdev != 0) {
+    main_dev = st.st_rdev;
+  } else if (stat("/dev/dri/card0", &st) == 0 && st.st_rdev != 0) {
+    main_dev = st.st_rdev;
+  }
+
+  struct FormatTableEntry {
+    uint32_t format;
+    uint32_t pad;
+    uint64_t modifier;
+  };
+  constexpr uint64_t kDrmFormatModLinear = 0ULL;
+  constexpr uint64_t kDrmFormatModInvalid = 0x00ffffffffffffffULL;
+  const uint32_t formats[] = {kDrmFormatARGB8888, kDrmFormatXRGB8888, kDrmFormatABGR8888,
+                              kDrmFormatXBGR8888};
+  FormatTableEntry entries[8]{};
+  for (size_t i = 0; i < 4; ++i) {
+    entries[i * 2 + 0] = {formats[i], 0u, kDrmFormatModLinear};
+    entries[i * 2 + 1] = {formats[i], 0u, kDrmFormatModInvalid};
+  }
+
+  int table_fd = memfd_create("vkwlf-dmabuf-feedback-table", MFD_CLOEXEC);
+  if (table_fd >= 0) {
+    if (write(table_fd, entries, sizeof(entries)) == static_cast<ssize_t>(sizeof(entries))) {
+      lseek(table_fd, 0, SEEK_SET);
+      zwp_linux_dmabuf_feedback_v1_send_format_table(fb_res, table_fd, sizeof(entries));
+    }
+    close(table_fd);
+  }
+
+  struct wl_array dev_arr;
+  wl_array_init(&dev_arr);
+  if (auto* p = static_cast<dev_t*>(wl_array_add(&dev_arr, sizeof(dev_t)))) {
+    *p = main_dev;
+  }
+  zwp_linux_dmabuf_feedback_v1_send_main_device(fb_res, &dev_arr);
+  zwp_linux_dmabuf_feedback_v1_send_tranche_target_device(fb_res, &dev_arr);
+  zwp_linux_dmabuf_feedback_v1_send_tranche_flags(
+      fb_res, ZWP_LINUX_DMABUF_FEEDBACK_V1_TRANCHE_FLAGS_SCANOUT);
+
+  struct wl_array idx_arr;
+  wl_array_init(&idx_arr);
+  for (uint16_t idx = 0; idx < 8; ++idx) {
+    if (auto* pi = static_cast<uint16_t*>(wl_array_add(&idx_arr, sizeof(uint16_t)))) {
+      *pi = idx;
+    }
+  }
+  zwp_linux_dmabuf_feedback_v1_send_tranche_formats(fb_res, &idx_arr);
+  wl_array_release(&idx_arr);
+  wl_array_release(&dev_arr);
+
+  zwp_linux_dmabuf_feedback_v1_send_tranche_done(fb_res);
+  zwp_linux_dmabuf_feedback_v1_send_done(fb_res);
+}
+
+void DmaBufGetDefaultFeedback(struct wl_client* client,
+                              struct wl_resource* resource,
+                              uint32_t id) {
+  struct wl_resource* fb_res = wl_resource_create(
+      client, &zwp_linux_dmabuf_feedback_v1_interface, wl_resource_get_version(resource), id);
+  if (!fb_res) {
+    wl_resource_post_no_memory(resource);
+    return;
+  }
+  wl_resource_set_implementation(fb_res, &kDmaBufFeedbackImpl, nullptr, nullptr);
+  SendDmaBufFeedbackEvents(fb_res);
+}
+
+void DmaBufGetSurfaceFeedback(struct wl_client* client,
+                              struct wl_resource* resource,
+                              uint32_t id,
+                              struct wl_resource* /*surface*/) {
+  DmaBufGetDefaultFeedback(client, resource, id);
+}
+
 const struct zwp_linux_dmabuf_v1_interface kLinuxDmaBufImpl = {
     .destroy = GenericResourceDestroy,
     .create_params = DmaBufCreateParams,
+    .get_default_feedback = DmaBufGetDefaultFeedback,
+    .get_surface_feedback = DmaBufGetSurfaceFeedback,
 };
 
 void BindLinuxDmaBuf(struct wl_client* client, void* data, uint32_t version, uint32_t id) {
   auto* engine = static_cast<WaylandServerEngine*>(data);
-  uint32_t bound_ver = std::min<uint32_t>(version, 3);
+  uint32_t bound_ver = std::min<uint32_t>(version, 4);
   struct wl_resource* res =
       wl_resource_create(client, &zwp_linux_dmabuf_v1_interface, bound_ver, id);
   if (!res) {
@@ -830,12 +916,15 @@ void BindLinuxDmaBuf(struct wl_client* client, void* data, uint32_t version, uin
   }
   wl_resource_set_implementation(res, &kLinuxDmaBufImpl, engine, nullptr);
 
-  const uint32_t formats[] = {kDrmFormatARGB8888, kDrmFormatXRGB8888, kDrmFormatABGR8888,
-                              kDrmFormatXBGR8888};
-  for (uint32_t fmt : formats) {
-    zwp_linux_dmabuf_v1_send_format(res, fmt);
-    if (bound_ver >= 3) {
-      zwp_linux_dmabuf_v1_send_modifier(res, fmt, 0, 0);
+  if (bound_ver < 4) {
+    const uint32_t formats[] = {kDrmFormatARGB8888, kDrmFormatXRGB8888, kDrmFormatABGR8888,
+                                kDrmFormatXBGR8888};
+    for (uint32_t fmt : formats) {
+      zwp_linux_dmabuf_v1_send_format(res, fmt);
+      if (bound_ver >= 3) {
+        zwp_linux_dmabuf_v1_send_modifier(res, fmt, 0, 0);
+        zwp_linux_dmabuf_v1_send_modifier(res, fmt, 0x00ffffffu, 0xffffffffu);
+      }
     }
   }
 }
@@ -1008,30 +1097,24 @@ void SurfaceCommit(struct wl_client* /*client*/, struct wl_resource* resource) {
       }
     }
 
+    // Latch xdg_surface.set_window_geometry (double-buffered state) for both wl_shm and dma_buf.
+    if (surf->pending_geometry_set) {
+      surf->has_geometry = true;
+      surf->geom_x = surf->pending_geom_x;
+      surf->geom_y = surf->pending_geom_y;
+      surf->geom_w = surf->pending_geom_w;
+      surf->geom_h = surf->pending_geom_h;
+      surf->pending_geometry_set = false;
+    }
+
     struct wl_shm_buffer* shm_buf = wl_shm_buffer_get(buf_res);
     if (shm_buf) {
-#ifdef __ANDROID__
-      // On the Android host, import local Wayland client buffers directly into a GPU
-      // AHardwareBuffer via VK_ANDROID_external_memory_android_hardware_buffer (no VkBuffer staging).
       frame.buffer_type = BufferType::kDmaBuf;
-#else
-      // Standard wl_shm buffer path
-      frame.buffer_type = BufferType::kShm;
-#endif
       frame.width = static_cast<uint32_t>(wl_shm_buffer_get_width(shm_buf));
       frame.height = static_cast<uint32_t>(wl_shm_buffer_get_height(shm_buf));
       frame.stride = static_cast<uint32_t>(wl_shm_buffer_get_stride(shm_buf));
       frame.format = wl_shm_buffer_get_format(shm_buf);
 
-      // Latch xdg_surface.set_window_geometry (double-buffered state).
-      if (surf->pending_geometry_set) {
-        surf->has_geometry = true;
-        surf->geom_x = surf->pending_geom_x;
-        surf->geom_y = surf->pending_geom_y;
-        surf->geom_w = surf->pending_geom_w;
-        surf->geom_h = surf->pending_geom_h;
-        surf->pending_geometry_set = false;
-      }
       // Crop to the window geometry when it is a strict sub-rectangle of the buffer:
       // CSD clients (Chromium, GTK) leave the area outside it undefined (shadows or
       // stale pool memory), and it must not be presented or counted as window size.
@@ -1076,6 +1159,33 @@ void SurfaceCommit(struct wl_client* /*client*/, struct wl_resource* resource) {
       }
       wl_shm_buffer_end_access(shm_buf);
 
+#ifndef __ANDROID__
+      // Export the buffer into a memfd DMA-BUF descriptor on the Linux guest so guest VkRenderer
+      // imports it via VK_KHR_external_memory_fd / VK_EXT_external_memory_host with shm_uploads=0.
+      if (!frame.shm_pixels.empty()) {
+        int mfd = memfd_create("vkwlf-guest-dmabuf", MFD_CLOEXEC);
+        if (mfd >= 0 && ftruncate(mfd, static_cast<off_t>(frame.shm_pixels.size())) == 0) {
+          void* mapped = mmap(nullptr, frame.shm_pixels.size(), PROT_READ | PROT_WRITE, MAP_SHARED,
+                              mfd, 0);
+          if (mapped != MAP_FAILED) {
+            std::memcpy(mapped, frame.shm_pixels.data(), frame.shm_pixels.size());
+            munmap(mapped, frame.shm_pixels.size());
+            frame.dmabuf_fd = mfd;
+            frame.planes.push_back(DmaBufPlane{
+                .fd = dup(mfd),
+                .offset = 0,
+                .stride = frame.stride,
+                .modifier = 0,
+            });
+          } else {
+            close(mfd);
+          }
+        } else if (mfd >= 0) {
+          close(mfd);
+        }
+      }
+#endif
+
       LOGV(kTag,
            "wl_surface.commit [host_buffer]: surface=%u frame=%llu title='%s' size=%ux%u stride=%u format=0x%x%s",
            frame.surface_id, static_cast<unsigned long long>(frame.frame_number),
@@ -1096,14 +1206,80 @@ void SurfaceCommit(struct wl_client* /*client*/, struct wl_resource* resource) {
         frame.stride = dmabuf->planes[0].stride;
         frame.format = dmabuf->format;
         frame.drm_modifier = dmabuf->planes[0].modifier;
-        frame.dmabuf_fd = dup(dmabuf->planes[0].fd);
-        for (const auto& p : dmabuf->planes) {
-          frame.planes.push_back(DmaBufPlane{
-              .fd = (p.fd >= 0) ? dup(p.fd) : -1,
-              .offset = p.offset,
-              .stride = p.stride,
-              .modifier = p.modifier,
-          });
+
+        int32_t crop_x = 0, crop_y = 0;
+        uint32_t crop_w = frame.width, crop_h = frame.height;
+        if (surf->has_geometry && surf->geom_w > 0 && surf->geom_h > 0 &&
+            surf->geom_x >= 0 && surf->geom_y >= 0 &&
+            static_cast<uint32_t>(surf->geom_x + surf->geom_w) <= frame.width &&
+            static_cast<uint32_t>(surf->geom_y + surf->geom_h) <= frame.height &&
+            (static_cast<uint32_t>(surf->geom_w) != frame.width ||
+             static_cast<uint32_t>(surf->geom_h) != frame.height)) {
+          crop_x = surf->geom_x;
+          crop_y = surf->geom_y;
+          crop_w = static_cast<uint32_t>(surf->geom_w);
+          crop_h = static_cast<uint32_t>(surf->geom_h);
+        }
+        if (surf->xdg_toplevel_resource != nullptr && surf->parent_surface_id == 0 &&
+            crop_w >= (engine->config().display_width * 3) / 4 &&
+            crop_h >= (engine->config().display_height * 3) / 4) {
+          engine->SetToplevelGeometry(crop_x, crop_y, crop_w, crop_h);
+        }
+
+        const bool is_ahb_handle =
+            (dmabuf->planes.size() >= 2 &&
+             dmabuf->planes.back().modifier == 0x414842484E444C00ULL);
+        if (!is_ahb_handle && (crop_w != frame.width || crop_h != frame.height)) {
+          const uint32_t plane_offset = dmabuf->planes[0].offset;
+          const size_t src_map_len =
+              static_cast<size_t>(plane_offset) + static_cast<size_t>(frame.stride) * frame.height;
+          void* src_map = mmap(nullptr, src_map_len, PROT_READ, MAP_SHARED, dmabuf->planes[0].fd, 0);
+          if (src_map != MAP_FAILED) {
+            const uint32_t dst_stride = crop_w * 4;
+            const size_t dst_bytes = static_cast<size_t>(dst_stride) * crop_h;
+            int mfd = memfd_create("vkwlf-cropped-dmabuf", MFD_CLOEXEC);
+            if (mfd >= 0 && ftruncate(mfd, static_cast<off_t>(dst_bytes)) == 0) {
+              void* dst_map = mmap(nullptr, dst_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+              if (dst_map != MAP_FAILED) {
+                const auto* src_base = static_cast<const uint8_t*>(src_map) + plane_offset;
+                auto* dst_base = static_cast<uint8_t*>(dst_map);
+                for (uint32_t row = 0; row < crop_h; ++row) {
+                  std::memcpy(dst_base + static_cast<size_t>(row) * dst_stride,
+                              src_base + static_cast<size_t>(crop_y + row) * frame.stride +
+                                  static_cast<size_t>(crop_x) * 4,
+                              dst_stride);
+                }
+                munmap(dst_map, dst_bytes);
+                frame.width = crop_w;
+                frame.height = crop_h;
+                frame.stride = dst_stride;
+                frame.dmabuf_fd = mfd;
+                frame.planes.push_back(DmaBufPlane{
+                    .fd = dup(mfd),
+                    .offset = 0,
+                    .stride = dst_stride,
+                    .modifier = 0,
+                });
+              } else {
+                close(mfd);
+              }
+            } else if (mfd >= 0) {
+              close(mfd);
+            }
+            munmap(src_map, src_map_len);
+          }
+        }
+
+        if (frame.dmabuf_fd < 0) {
+          frame.dmabuf_fd = dup(dmabuf->planes[0].fd);
+          for (const auto& p : dmabuf->planes) {
+            frame.planes.push_back(DmaBufPlane{
+                .fd = (p.fd >= 0) ? dup(p.fd) : -1,
+                .offset = p.offset,
+                .stride = p.stride,
+                .modifier = p.modifier,
+            });
+          }
         }
 
         LOGV(kTag,
@@ -2005,7 +2181,7 @@ bool WaylandServerEngine::Initialize() {
   wl_global_create(display_, &wl_subcompositor_interface, 1, this, BindSubcompositor);
   wl_global_create(display_, &wl_data_device_manager_interface, 3, this, BindDataDeviceManager);
   wl_global_create(display_, &xdg_wm_base_interface, 3, this, BindXdgWmBase);
-  wl_global_create(display_, &zwp_linux_dmabuf_v1_interface, 3, this, BindLinuxDmaBuf);
+  wl_global_create(display_, &zwp_linux_dmabuf_v1_interface, 4, this, BindLinuxDmaBuf);
   wl_global_create(display_, &wl_output_interface, 3, this, BindOutput);
   wl_global_create(display_, &wl_seat_interface, 5, this, BindSeat);
 
@@ -2151,8 +2327,7 @@ int WaylandServerEngine::OnBridgeClientDataEvent(int fd, uint32_t /*mask*/, void
   if (!bc || !bc->engine) return 0;
   WaylandServerEngine* engine = bc->engine;
 
-  BridgeFrameHeader hdr{};
-  if (!ReadAll(fd, &hdr, sizeof(hdr)) || hdr.magic != kBridgeFrameMagic) {
+  auto disconnect_client = [&]() -> int {
     LOGI(kTag, "Guest bridge client disconnected (fd=%d)", fd);
     if (bc->source) {
       wl_event_source_remove(bc->source);
@@ -2161,23 +2336,28 @@ int WaylandServerEngine::OnBridgeClientDataEvent(int fd, uint32_t /*mask*/, void
     close(fd);
     bc->fd = -1;
     return 0;
+  };
+
+  BridgeFrameHeader hdr{};
+  if (!ReadAll(fd, &hdr, sizeof(hdr)) || hdr.magic != kBridgeFrameMagic) {
+    return disconnect_client();
   }
 
   std::string title(hdr.title_len, '\0');
   if (hdr.title_len > 0 && !ReadAll(fd, title.data(), hdr.title_len)) {
-    return 0;
+    return disconnect_client();
   }
   std::string app_id(hdr.app_id_len, '\0');
   if (hdr.app_id_len > 0 && !ReadAll(fd, app_id.data(), hdr.app_id_len)) {
-    return 0;
+    return disconnect_client();
   }
   std::vector<uint8_t> icon_png(hdr.icon_png_len);
   if (hdr.icon_png_len > 0 && !ReadAll(fd, icon_png.data(), hdr.icon_png_len)) {
-    return 0;
+    return disconnect_client();
   }
   std::vector<uint8_t> payload(hdr.payload_bytes);
   if (hdr.payload_bytes > 0 && !ReadAll(fd, payload.data(), hdr.payload_bytes)) {
-    return 0;
+    return disconnect_client();
   }
 
   CommittedFrame frame;
@@ -2215,6 +2395,7 @@ int WaylandServerEngine::OnBridgeClientDataEvent(int fd, uint32_t /*mask*/, void
             .stride = frame.stride,
             .modifier = 0,
         });
+        frame.shm_pixels = std::move(payload);
       } else {
         close(mfd);
         frame.buffer_type = BufferType::kShm;
@@ -2267,17 +2448,19 @@ bool WaylandServerEngine::SendFrameOverBridgeSocket(int sock_fd, const Committed
   const uint8_t* pixel_ptr = nullptr;
   size_t pixel_bytes = 0;
   void* mapped_dmabuf = MAP_FAILED;
-  size_t mapped_len = static_cast<size_t>(frame.stride) * frame.height;
+  const uint32_t plane_offset = frame.planes.empty() ? 0u : frame.planes[0].offset;
+  size_t mapped_len =
+      static_cast<size_t>(plane_offset) + static_cast<size_t>(frame.stride) * frame.height;
 
   if (!frame.is_unmapped) {
-    if (frame.buffer_type == BufferType::kShm) {
+    if (!frame.shm_pixels.empty()) {
       pixel_ptr = frame.shm_pixels.data();
       pixel_bytes = frame.shm_pixels.size();
-    } else if (frame.buffer_type == BufferType::kDmaBuf && frame.dmabuf_fd >= 0 && mapped_len > 0) {
+    } else if (frame.dmabuf_fd >= 0 && mapped_len > 0) {
       mapped_dmabuf = mmap(nullptr, mapped_len, PROT_READ, MAP_SHARED, frame.dmabuf_fd, 0);
       if (mapped_dmabuf != MAP_FAILED) {
-        pixel_ptr = static_cast<const uint8_t*>(mapped_dmabuf);
-        pixel_bytes = mapped_len;
+        pixel_ptr = static_cast<const uint8_t*>(mapped_dmabuf) + plane_offset;
+        pixel_bytes = static_cast<size_t>(frame.stride) * frame.height;
       }
     }
   }
@@ -2293,7 +2476,7 @@ bool WaylandServerEngine::SendFrameOverBridgeSocket(int sock_fd, const Committed
   hdr.height = frame.height;
   hdr.stride = frame.stride;
   hdr.format = frame.format;
-  hdr.buffer_type = static_cast<uint32_t>(frame.buffer_type);
+  hdr.buffer_type = static_cast<uint32_t>(BufferType::kDmaBuf);
   hdr.is_popup = frame.is_popup ? 1 : 0;
   hdr.is_subsurface = frame.is_subsurface ? 1 : 0;
   hdr.is_unmapped = frame.is_unmapped ? 1 : 0;

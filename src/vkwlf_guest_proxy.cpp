@@ -1,7 +1,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/vm_sockets.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -14,6 +16,7 @@
 #include <thread>
 
 #include "log_macros.h"
+#include "vk_renderer.h"
 #include "wayland_server_engine.h"
 
 namespace {
@@ -41,7 +44,7 @@ int ConnectVsock(unsigned int cid, unsigned int port) {
 }
 
 int ConnectTcp(const std::string& host_ip, uint16_t port) {
-  int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
   if (fd < 0) return -1;
 
   struct sockaddr_in addr {};
@@ -52,12 +55,32 @@ int ConnectTcp(const std::string& host_ip, uint16_t port) {
     return -1;
   }
 
-  if (connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0) {
-    LOGI(kTag, "Connected to host VkWlfCompositor over TCP (%s:%u)", host_ip.c_str(), port);
-    return fd;
+  int res = connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+  if (res < 0 && errno != EINPROGRESS) {
+    close(fd);
+    return -1;
   }
-  close(fd);
-  return -1;
+  if (res < 0) {
+    struct pollfd pfd {};
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    if (poll(&pfd, 1, 200) <= 0 || !(pfd.revents & POLLOUT)) {
+      close(fd);
+      return -1;
+    }
+    int so_err = 0;
+    socklen_t err_len = sizeof(so_err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_err, &err_len) < 0 || so_err != 0) {
+      close(fd);
+      return -1;
+    }
+  }
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags >= 0) {
+    fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+  }
+  LOGI(kTag, "Connected to host VkWlfCompositor over TCP (%s:%u)", host_ip.c_str(), port);
+  return fd;
 }
 
 int ConnectToHostCompositor(unsigned int vsock_cid,
@@ -103,6 +126,7 @@ int main(int argc, char** argv) {
   uint32_t width = 1280;
   uint32_t height = 720;
   uint64_t max_frames = 0;
+  std::string dump_ppm_path;
 
   for (int i = 1; i < argc; ++i) {
     if (strcmp(argv[i], "--socket") == 0 && i + 1 < argc) {
@@ -121,6 +145,8 @@ int main(int argc, char** argv) {
       height = static_cast<uint32_t>(std::atoi(argv[++i]));
     } else if (strcmp(argv[i], "--max-frames") == 0 && i + 1 < argc) {
       max_frames = static_cast<uint64_t>(std::atoll(argv[++i]));
+    } else if (strcmp(argv[i], "--dump-ppm") == 0 && i + 1 < argc) {
+      dump_ppm_path = argv[++i];
     }
   }
 
@@ -141,6 +167,94 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  vkwlf::VkRenderer::Config vk_cfg;
+  vk_cfg.width = width;
+  vk_cfg.height = height;
+  vkwlf::VkRenderer guest_renderer(vk_cfg);
+  bool guest_vk_ready = guest_renderer.Initialize(nullptr);
+  if (guest_vk_ready) {
+    LOGI(kTag, "Initialized Guest Vulkan Compositor (%ux%u) for zero-copy zwp_linux_dmabuf_v1 import",
+         width, height);
+  }
+
+  std::mutex vk_queue_mu;
+  std::condition_variable vk_queue_cv;
+  vkwlf::CommittedFrame pending_vk_frame;
+  bool has_pending_vk_frame = false;
+
+  auto EnqueueGuestVulkanFrame = [&](const vkwlf::CommittedFrame& src) {
+    if (!guest_vk_ready) return;
+    vkwlf::CommittedFrame copy;
+    copy.surface_id = src.surface_id;
+    copy.parent_surface_id = src.parent_surface_id;
+    copy.frame_number = src.frame_number;
+    copy.title = src.title;
+    copy.app_id = src.app_id;
+    copy.x = src.x;
+    copy.y = src.y;
+    copy.width = src.width;
+    copy.height = src.height;
+    copy.stride = src.stride;
+    copy.format = src.format;
+    copy.drm_modifier = src.drm_modifier;
+    copy.buffer_type = src.buffer_type;
+    copy.is_popup = src.is_popup;
+    copy.is_subsurface = src.is_subsurface;
+    copy.is_unmapped = src.is_unmapped;
+    copy.dmabuf_fd = (src.dmabuf_fd >= 0) ? dup(src.dmabuf_fd) : -1;
+    for (const auto& p : src.planes) {
+      copy.planes.push_back(vkwlf::DmaBufPlane{
+          .fd = (p.fd >= 0) ? dup(p.fd) : -1,
+          .offset = p.offset,
+          .stride = p.stride,
+          .modifier = p.modifier,
+      });
+    }
+    if (copy.dmabuf_fd < 0 && !src.shm_pixels.empty()) {
+      copy.shm_pixels = src.shm_pixels;
+    }
+    {
+      std::lock_guard<std::mutex> lock(vk_queue_mu);
+      if (has_pending_vk_frame) {
+        if (pending_vk_frame.dmabuf_fd >= 0) close(pending_vk_frame.dmabuf_fd);
+        for (auto& p : pending_vk_frame.planes) {
+          if (p.fd >= 0) close(p.fd);
+        }
+      }
+      pending_vk_frame = std::move(copy);
+      has_pending_vk_frame = true;
+    }
+    vk_queue_cv.notify_one();
+  };
+
+  std::thread guest_vk_worker([&]() {
+    while (g_running.load()) {
+      vkwlf::CommittedFrame vk_frame;
+      {
+        std::unique_lock<std::mutex> lock(vk_queue_mu);
+        vk_queue_cv.wait_for(lock, std::chrono::milliseconds(50),
+                             [&]() { return has_pending_vk_frame || !g_running.load(); });
+        if (!has_pending_vk_frame) continue;
+        vk_frame = std::move(pending_vk_frame);
+        has_pending_vk_frame = false;
+      }
+      if (guest_vk_ready) {
+        guest_renderer.ProcessAndPresentFrame(vk_frame);
+        auto stats = guest_renderer.GetStats();
+        if (stats.presents_succeeded <= 5 || (stats.presents_succeeded % 60 == 0)) {
+          LOGI(kTag,
+               "[GuestVulkanGPU] Composited Wayland frame #%llu (surface=%u, buffer_type=%s, "
+               "shm_uploads=%llu, dmabuf_imports=%llu, presents=%llu)",
+               static_cast<unsigned long long>(vk_frame.frame_number), vk_frame.surface_id,
+               vk_frame.buffer_type == vkwlf::BufferType::kDmaBuf ? "DMA-BUF" : "SHM",
+               static_cast<unsigned long long>(stats.shm_uploads),
+               static_cast<unsigned long long>(stats.dmabuf_imports),
+               static_cast<unsigned long long>(stats.presents_succeeded));
+        }
+      }
+    }
+  });
+
   int host_fd = -1;
   uint64_t forwarded_frames = 0;
   vkwlf::CommittedFrame last_toplevel_frame;
@@ -150,6 +264,10 @@ int main(int argc, char** argv) {
     host_fd = ConnectToHostCompositor(vsock_cid, vsock_port, host_ip, tcp_port);
     if (host_fd < 0) {
       LOGE(kTag, "Failed to connect to host VkWlfCompositor");
+      g_running.store(false);
+      vk_queue_cv.notify_all();
+      if (guest_vk_worker.joinable()) guest_vk_worker.join();
+      if (guest_vk_ready) guest_renderer.Shutdown();
       guest_server.Stop();
       return 1;
     }
@@ -161,9 +279,10 @@ int main(int argc, char** argv) {
       // keeping the latest toplevel frame cached for instant display on connect.
       vkwlf::CommittedFrame pending;
       while (guest_server.PopCommittedFrame(&pending, 0)) {
+        EnqueueGuestVulkanFrame(pending);
         if (!pending.is_popup && !pending.is_subsurface && !pending.is_unmapped &&
-            !pending.shm_pixels.empty() && pending.parent_surface_id == 0 &&
-            pending.width >= (width * 3) / 4) {
+            (!pending.shm_pixels.empty() || pending.dmabuf_fd >= 0) &&
+            pending.parent_surface_id == 0 && pending.width >= (width * 3) / 4) {
           if (last_toplevel_frame.dmabuf_fd >= 0) close(last_toplevel_frame.dmabuf_fd);
           for (auto& p : last_toplevel_frame.planes) {
             if (p.fd >= 0) close(p.fd);
@@ -203,9 +322,10 @@ int main(int argc, char** argv) {
       vkwlf::CommittedFrame frame;
       if (guest_server.PopCommittedFrame(&frame, 16)) {
         bool sent = vkwlf::WaylandServerEngine::SendFrameOverBridgeSocket(host_fd, frame);
+        EnqueueGuestVulkanFrame(frame);
         if (!frame.is_popup && !frame.is_subsurface && !frame.is_unmapped &&
-            !frame.shm_pixels.empty() && frame.parent_surface_id == 0 &&
-            frame.width >= (width * 3) / 4) {
+            (!frame.shm_pixels.empty() || frame.dmabuf_fd >= 0) &&
+            frame.parent_surface_id == 0 && frame.width >= (width * 3) / 4) {
           if (last_toplevel_frame.dmabuf_fd >= 0) close(last_toplevel_frame.dmabuf_fd);
           for (auto& p : last_toplevel_frame.planes) {
             if (p.fd >= 0) close(p.fd);
@@ -245,6 +365,27 @@ int main(int argc, char** argv) {
     }
   }
 
+  g_running.store(false);
+  vk_queue_cv.notify_all();
+  if (guest_vk_worker.joinable()) {
+    guest_vk_worker.join();
+  }
+  {
+    std::lock_guard<std::mutex> lock(vk_queue_mu);
+    if (has_pending_vk_frame) {
+      if (pending_vk_frame.dmabuf_fd >= 0) close(pending_vk_frame.dmabuf_fd);
+      for (auto& p : pending_vk_frame.planes) {
+        if (p.fd >= 0) close(p.fd);
+      }
+      has_pending_vk_frame = false;
+    }
+  }
+  if (guest_vk_ready) {
+    if (!dump_ppm_path.empty()) {
+      guest_renderer.SaveLastFramePpm(dump_ppm_path);
+    }
+    guest_renderer.Shutdown();
+  }
   if (last_toplevel_frame.dmabuf_fd >= 0) close(last_toplevel_frame.dmabuf_fd);
   for (auto& p : last_toplevel_frame.planes) {
     if (p.fd >= 0) close(p.fd);

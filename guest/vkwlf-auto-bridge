@@ -27,6 +27,18 @@ while true; do
   HOST="$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}')"
   [[ -z "$HOST" ]] && HOST="10.60.251.164"
 
+  # Always prioritize gfxstream_vk_icd.json first, falling back to lvp_icd.json if the
+  # host hypervisor launched virtio-gpu with 0 capsets (2D mode).
+  export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/gfxstream_vk_icd.json:/usr/share/vulkan/icd.d/lvp_icd.json"
+  export VK_DRIVER_FILES="/usr/share/vulkan/icd.d/gfxstream_vk_icd.json:/usr/share/vulkan/icd.d/lvp_icd.json"
+  if sudo -n dmesg 2>/dev/null | grep -q "number of cap sets: [1-9]"; then
+    export MESA_LOADER_DRIVER_OVERRIDE=zink
+    unset LIBGL_ALWAYS_SOFTWARE
+  else
+    unset MESA_LOADER_DRIVER_OVERRIDE
+    unset LIBGL_ALWAYS_SOFTWARE
+  fi
+
   rm -f "$SOCK" "$SOCK.lock"
   /usr/local/bin/vkwlf_guest_proxy --socket "$SOCK" --host-ip "$HOST" --tcp-port 5555 --vsock-port 0 --width 2382 --height 1299 > "$RT/proxy.log" 2>&1 &
   PROXY_PID=$!
@@ -43,7 +55,7 @@ while true; do
         /usr/share/antigravity/antigravity \
         --ozone-platform=wayland \
         --enable-features=UseOzonePlatform \
-        --disable-gpu \
+        --ignore-gpu-blocklist \
         --ignore-certificate-errors \
         --user-data-dir="$HOME/.config/Antigravity-vkwlf" \
         "$HOME/VlkWlfApp" > "$RT/antigravity.log" 2>&1 &

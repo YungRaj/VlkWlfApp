@@ -41,6 +41,16 @@ RT="/tmp/vkwlf-xdg-$(id -u)"; mkdir -p "$RT"; chmod 700 "$RT"
 SOCK="$RT/wayland-0"; rm -f "$SOCK" "$SOCK.lock"
 W="${SIZE%x*}"; H="${SIZE#*x}"
 
+export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/gfxstream_vk_icd.json:/usr/share/vulkan/icd.d/lvp_icd.json"
+export VK_DRIVER_FILES="/usr/share/vulkan/icd.d/gfxstream_vk_icd.json:/usr/share/vulkan/icd.d/lvp_icd.json"
+if sudo -n dmesg 2>/dev/null | grep -q "number of cap sets: [1-9]"; then
+  export MESA_LOADER_DRIVER_OVERRIDE=zink
+  unset LIBGL_ALWAYS_SOFTWARE
+else
+  unset MESA_LOADER_DRIVER_OVERRIDE
+  unset LIBGL_ALWAYS_SOFTWARE
+fi
+
 if timeout 0.5 bash -c "</dev/tcp/$HOST/$PORT" 2>/dev/null; then
   echo "vkwlf-run: proxy -> $HOST:$PORT, display $SOCK (${W}x${H})"
   "$PROXY" --socket "$SOCK" --host-ip "$HOST" --tcp-port "$PORT" --vsock-port 0 \

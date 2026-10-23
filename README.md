@@ -132,15 +132,15 @@ For **Antigravity** (a public Electron IDE) inside the VM —
 install the Linux `.deb` from antigravity.google first, then:
 
 ```bash
-vkwlf-run -- antigravity --disable-gpu ~/workspace
+vkwlf-run -- antigravity --ignore-gpu-blocklist ~/workspace
 ```
 
 `vkwlf-run` already exports `ELECTRON_OZONE_PLATFORM_HINT=wayland`,
 `GDK_BACKEND=wayland` and `QT_QPA_PLATFORM=wayland`, so Electron, GTK and Qt
-apps pick the Wayland backend without extra flags. For an Electron app that
-ignores the hint, add `--ozone-platform=wayland --enable-features=UseOzonePlatform`.
-`--disable-gpu` is correct here: the Terminal VM has no 3D GPU, so Chromium
-rasterises with SwiftShader; dropping the flag only adds a failed GPU probe.
+apps pick the Wayland backend without extra flags. With `--ignore-gpu-blocklist`,
+Chromium's GPU process allocates DRM PRIME `zwp_linux_dmabuf_v1` (`AB24`) buffers
+via `/dev/dri/card0` & `/dev/dri/renderD128` (`zwp_linux_dmabuf_feedback_v1` v4)
+and submits them zero-copy to `vkwlf_guest_proxy` (`shm_uploads=0`).
 
 The window shows up on the Android desktop with the app's icon and title
 (resolved from its `app_id` via the guest's `/usr/share/applications` +
@@ -159,13 +159,97 @@ installed a static overlay (`com.google.example.vkwlf.overlay`) during
 development, uninstall it; SystemUI caches the overlaid label until it restarts.
 
 What has been verified end to end over the bridge with an Electron IDE
-(Antigravity build): continuous frames (~60 fps at 1280×800), window
-title/app_id/icon, keyboard input landing in the editor, pointer clicks, and
-`xdg_popup` menus (File menu). Any `wl_shm` + `xdg-shell` client (GTK, Qt,
-SDL, Electron, weston clients) takes the same path; 3D/GL apps render via
-llvmpipe inside the VM and are out of scope.
+(Antigravity build): continuous frames (~60 fps at 2382×1299), zero-copy
+`zwp_linux_dmabuf_v1` v4 client buffer commits (`fourcc=0x34324241`), Vulkan
+external memory import (`VK_KHR_external_memory_fd` / `VK_EXT_external_memory_host`,
+`shm_uploads=0`), window title/app_id/icon, keyboard input landing in the editor,
+pointer clicks, and `xdg_popup` menus (File menu).
 
-## 4. Troubleshooting
+## 4. Enabling Full GPU Acceleration (`zwp_linux_dmabuf_v1` & `gfxstream_enabled=1`)
+
+`VkWlfApp` and `vkwlf_guest_proxy` implement a 4-phase GPU & DMA-BUF pipeline:
+
+1. **Phase 1 (Wayland Client GPU / GBM DMA-BUF)**: `WaylandServerEngine` advertises `zwp_linux_dmabuf_v1` **v4** (`zwp_linux_dmabuf_feedback_v1` with `/dev/dri/renderD128` + `DRM_FORMAT_MOD_LINEAR` + `DRM_FORMAT_MOD_INVALID`) so Wayland clients (including Antigravity IDE / Chromium Ozone Wayland) allocate DRM PRIME DMA-BUF buffers (`AB24` / `AR24`) instead of CPU `wl_shm` buffers.
+2. **Phase 2 (Guest Vulkan DMA-BUF Compositor)**: `VkRenderer` inside `vkwlf_guest_proxy` and `vkwlf_compositor` imports client DMA-BUF file descriptors directly into Vulkan (`VK_KHR_external_memory_fd` and `VK_EXT_external_memory_host`, handling both tight and 64-pixel-aligned DRM row strides with `shm_uploads=0`).
+3. **Phase 3 (VM-to-Host Bridge)**: `vkwlf_guest_proxy` streams `BufferType::kDmaBuf` frames over the bridge socket.
+4. **Phase 4 (Android Host Hardware GPU Compositor)**: `VkWlfApp` imports each frame into a persistent hardware `AHardwareBuffer` (`VK_ANDROID_external_memory_android_hardware_buffer`, `shm_uploads=0`) and presents via `VkSwapchainKHR` on the host GPU.
+
+### Enabling `gfxstream_enabled=1` by Default Inside the Debian Terminal VM
+
+To configure the Debian Terminal VM so `gfxstream_enabled=1` is enabled by default in GRUB and all shell/systemd sessions prioritize `gfxstream_vk_icd.json` first (with automatic fallback to `lvp_icd.json` when the hypervisor launches `virtio-gpu` in 2D mode):
+
+```bash
+# 1. Add gfxstream_enabled=1 to the GRUB kernel command line
+echo 'GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT gfxstream_enabled=1 gfxstream_enabled"' \
+  | sudo tee /etc/default/grub.d/99_gfxstream.cfg >/dev/null
+sudo sed -i '/vmlinuz-/{/gfxstream_enabled/!s/$/ gfxstream_enabled=1 gfxstream_enabled/}' /boot/grub/grub.cfg
+
+# 2. Configure /usr/local/bin/enable_gfxstream to prioritize gfxstream_vk_icd.json with lvp_icd.json fallback
+sudo tee /usr/local/bin/enable_gfxstream >/dev/null <<'EOF'
+#!/bin/bash
+sudo systemd-run --quiet --collect -E XDG_SESSION_TYPE=wayland --uid=1000 -p PAMName=login -p TTYPath=/dev/tty1 sleep 1d 2>/dev/null || true
+export DISPLAY=:0
+if grep -q -w "wayland_bridge" /proc/cmdline; then
+  export WAYLAND_DISPLAY=wayland-proxy-0
+fi
+export GFXSTREAM_ENABLED=1
+if sudo -n dmesg 2>/dev/null | grep -q "number of cap sets: [1-9]"; then
+  export MESA_LOADER_DRIVER_OVERRIDE=zink
+else
+  unset MESA_LOADER_DRIVER_OVERRIDE
+fi
+unset LIBGL_ALWAYS_SOFTWARE
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/gfxstream_vk_icd.json:/usr/share/vulkan/icd.d/lvp_icd.json
+export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/gfxstream_vk_icd.json:/usr/share/vulkan/icd.d/lvp_icd.json
+export MESA_VK_WSI_DEBUG=sw
+export XWAYLAND_NO_GLAMOR=1
+export LIBGL_KOPPER_DRI2=1
+EOF
+sudo chmod +x /usr/local/bin/enable_gfxstream
+
+# 3. Enable /usr/local/bin/enable_gfxstream by default in /etc/profile.d/activate_display.sh
+sudo tee /etc/profile.d/activate_display.sh >/dev/null <<'EOF'
+#!/bin/bash
+if [[ "$USER" == "droid" && -n "$PS1" ]]; then
+  source /usr/local/bin/enable_gfxstream
+fi
+EOF
+
+# 4. Install the updated proxy/compositor binaries and restart the auto-bridge service
+sudo install -m 755 build/vkwlf_compositor build/vkwlf_guest_proxy guest/vkwlf-auto-bridge guest/vkwlf-run /usr/local/bin/
+systemctl --user restart vkwlf-auto-bridge.service
+```
+
+### Enabling the Host Gfxstream 3D Ring on Android (`com.android.virtualization.terminal`)
+
+For the guest's `/dev/dri/renderD128` PCI device (`0000:00:01.0`) to expose host Gfxstream capability sets (`+context_init`, `number of cap sets > 0`), the Android host's `VmLauncherService` must start Crosvm with the `gfxstream` GPU backend:
+
+- **Via ADB on the Android host**:
+  ```bash
+  adb shell device_config put virtualization_framework_native terminal_gui_support true
+  adb shell am force-stop com.android.virtualization.terminal
+  ```
+- **On `userdebug` / rooted Android builds (`vm_config.json`)**:
+  Set the `"gpu"` block in the Terminal VM's `vm_config.json` and restart the Terminal app:
+  ```json
+  "params": "... gfxstream_enabled",
+  "gpu": {
+    "backend": "gfxstream",
+    "vulkan": true,
+    "surfaceless": true,
+    "context-types": "gfxstream-vulkan:gfxstream-composer"
+  }
+  ```
+
+### Verifying Zero-Copy DMA-BUF & Vulkan Composition
+
+Check `/tmp/vkwlf-xdg-1000/proxy.log` inside the VM to confirm `shm_uploads=0` and `buffer_type=DMA-BUF`:
+
+```bash
+grep -E "Created zero-copy|GuestVulkanGPU" /tmp/vkwlf-xdg-1000/proxy.log
+```
+
+## 5. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
