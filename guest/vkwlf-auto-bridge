@@ -5,18 +5,77 @@ RT="/tmp/vkwlf-xdg-$(id -u)"
 mkdir -p "$RT"
 chmod 700 "$RT"
 SOCK="$RT/wayland-0"
+XDISP=":15"
 
 cleanup() {
-  pkill -x antigravity 2>/dev/null || true
+  killall -q antigravity TeamViewer Xwayland 2>/dev/null || true
+  [[ -n "${WM_PID:-}" ]] && kill "$WM_PID" 2>/dev/null || true
   [[ -n "${PROXY_PID:-}" ]] && kill "$PROXY_PID" 2>/dev/null || true
   [[ -n "${CC_PROXY_PID:-}" ]] && kill "$CC_PROXY_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
+if ! loginctl list-sessions --no-legend 2>/dev/null | grep -q "tty1"; then
+  sudo -n systemd-run --quiet --collect -E XDG_SESSION_TYPE=wayland --uid=1000 -p PAMName=login -p TTYPath=/dev/tty1 sleep 1d 2>/dev/null || true
+fi
+
 if ! pgrep -f "/usr/local/bin/vkwlf-cloudcode-proxy" >/dev/null 2>&1; then
   /usr/local/bin/vkwlf-cloudcode-proxy > "$RT/cloudcode-proxy.log" 2>&1 &
   CC_PROXY_PID=$!
 fi
+
+start_x11_maximizer() {
+  DISPLAY="$XDISP" python3 -c '
+import ctypes, time
+x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+x11.XOpenDisplay.restype = ctypes.c_void_p
+dpy = x11.XOpenDisplay(b":15")
+if not dpy:
+    raise SystemExit(0)
+root = x11.XDefaultRootWindow(ctypes.c_void_p(dpy))
+sw = x11.XDisplayWidth(ctypes.c_void_p(dpy), 0)
+sh = x11.XDisplayHeight(ctypes.c_void_p(dpy), 0)
+
+class XWindowAttributes(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_int), ("y", ctypes.c_int),
+        ("width", ctypes.c_int), ("height", ctypes.c_int),
+        ("border_width", ctypes.c_int), ("depth", ctypes.c_int),
+        ("visual", ctypes.c_void_p), ("root", ctypes.c_ulong),
+        ("c_class", ctypes.c_int), ("bit_gravity", ctypes.c_int),
+        ("win_gravity", ctypes.c_int), ("backing_store", ctypes.c_int),
+        ("backing_planes", ctypes.c_ulong), ("backing_pixel", ctypes.c_ulong),
+        ("save_under", ctypes.c_int), ("colormap", ctypes.c_ulong),
+        ("map_installed", ctypes.c_int), ("map_state", ctypes.c_int),
+        ("all_event_masks", ctypes.c_long), ("your_event_mask", ctypes.c_long),
+        ("do_not_propagate_mask", ctypes.c_long), ("override_redirect", ctypes.c_int),
+        ("screen", ctypes.c_void_p)
+    ]
+
+while True:
+    root_ret = ctypes.c_ulong()
+    parent_ret = ctypes.c_ulong()
+    children_ptr = ctypes.POINTER(ctypes.c_ulong)()
+    nchildren = ctypes.c_uint()
+    if x11.XQueryTree(ctypes.c_void_p(dpy), ctypes.c_ulong(root),
+                      ctypes.byref(root_ret), ctypes.byref(parent_ret),
+                      ctypes.byref(children_ptr), ctypes.byref(nchildren)) != 0:
+        for i in range(nchildren.value):
+            w = children_ptr[i]
+            attr = XWindowAttributes()
+            if x11.XGetWindowAttributes(ctypes.c_void_p(dpy), ctypes.c_ulong(w), ctypes.byref(attr)) != 0:
+                if attr.map_state == 2 and attr.width >= 400 and attr.height >= 300:
+                    if attr.x != 0 or attr.y != 0 or attr.width != sw or attr.height != sh:
+                        x11.XMoveResizeWindow(ctypes.c_void_p(dpy), ctypes.c_ulong(w), 0, 0, sw, sh)
+                        x11.XRaiseWindow(ctypes.c_void_p(dpy), ctypes.c_ulong(w))
+                        x11.XFlush(ctypes.c_void_p(dpy))
+        if children_ptr:
+            x11.XFree(children_ptr)
+    time.sleep(0.5)
+' >/dev/null 2>&1 &
+  WM_PID=$!
+}
 
 while true; do
   if ! pgrep -f "/usr/local/bin/vkwlf-cloudcode-proxy" >/dev/null 2>&1; then
@@ -39,7 +98,7 @@ while true; do
     unset LIBGL_ALWAYS_SOFTWARE
   fi
 
-  rm -f "$SOCK" "$SOCK.lock"
+  rm -f "$SOCK" "$SOCK.lock" /tmp/.X15-lock /tmp/.X11-unix/X15
   /usr/local/bin/vkwlf_guest_proxy --socket "$SOCK" --host-ip "$HOST" --tcp-port 5555 --vsock-port 0 --width 2382 --height 1299 > "$RT/proxy.log" 2>&1 &
   PROXY_PID=$!
 
@@ -50,6 +109,7 @@ while true; do
   done
 
   while [[ -S "$SOCK" ]] && kill -0 "$PROXY_PID" 2>/dev/null; do
+    # 1. Keep AntiGravity IDE running on Wayland
     if ! pgrep -x antigravity >/dev/null 2>&1; then
       XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY="wayland-0" ELECTRON_OZONE_PLATFORM_HINT=wayland NODE_TLS_REJECT_UNAUTHORIZED=0 \
         /usr/share/antigravity/antigravity \
@@ -59,11 +119,42 @@ while true; do
         --ignore-certificate-errors \
         --user-data-dir="$HOME/.config/Antigravity-vkwlf" \
         "$HOME/VlkWlfApp" > "$RT/antigravity.log" 2>&1 &
-      sleep 2
+      sleep 1
     fi
-    sleep 1
+
+    # 2. Keep TeamViewer running in parallel on Xwayland :15 bridged into the same Wayland server
+    if [[ -x /opt/teamviewer/tv_bin/TeamViewer ]]; then
+      if ! pgrep -f "Xwayland $XDISP" >/dev/null 2>&1; then
+        rm -f /tmp/.X15-lock /tmp/.X11-unix/X15
+        XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY="wayland-0" \
+          Xwayland "$XDISP" -shm -noreset -geometry 1280x720 > "$RT/xwayland15.log" 2>&1 &
+        for _ in $(seq 1 30); do
+          [[ -S /tmp/.X11-unix/X15 ]] && break
+          sleep 0.1
+        done
+        if [[ -f /usr/local/share/vkwlf/default.xkb ]]; then
+          xkbcomp /usr/local/share/vkwlf/default.xkb "$XDISP" >/dev/null 2>&1 || true
+        elif [[ -f "$HOME/VlkWlfApp/guest/default.xkb" ]]; then
+          xkbcomp "$HOME/VlkWlfApp/guest/default.xkb" "$XDISP" >/dev/null 2>&1 || true
+        fi
+        [[ -n "${WM_PID:-}" ]] && kill "$WM_PID" 2>/dev/null || true
+        start_x11_maximizer
+      fi
+
+      if ! pgrep -x TeamViewer >/dev/null 2>&1; then
+        TV_SESSION_ID="$(loginctl list-sessions --no-legend 2>/dev/null | awk '/tty1/ {print $1; exit}')"
+        [[ -z "$TV_SESSION_ID" ]] && TV_SESSION_ID="1"
+        XDG_RUNTIME_DIR="/run/user/$(id -u)" WAYLAND_DISPLAY="wayland-0" XDG_SESSION_ID="$TV_SESSION_ID" \
+          QT_QPA_PLATFORM=xcb DISPLAY="$XDISP" \
+          /opt/teamviewer/tv_bin/TeamViewer > "$RT/teamviewer.log" 2>&1 &
+        sleep 1
+      fi
+    fi
+
+    sleep 2
   done
 
-  pkill -x antigravity 2>/dev/null || true
+  killall -q antigravity TeamViewer Xwayland 2>/dev/null || true
+  [[ -n "${WM_PID:-}" ]] && kill "$WM_PID" 2>/dev/null || true
   sleep 1
 done

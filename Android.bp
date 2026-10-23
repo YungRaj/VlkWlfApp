@@ -55,6 +55,10 @@ cc_defaults {
         "-Werror",
         "-DVK_USE_PLATFORM_ANDROID_KHR",
     ],
+    ldflags: [
+        "-Wl,-z,max-page-size=16384",
+        "-Wl,-z,common-page-size=16384",
+    ],
     local_include_dirs: [
         "include",
     ],

@@ -158,20 +158,27 @@ bool ResolveIconValueToPng(const std::string& icon_val, std::vector<uint8_t>* ou
   if (base.size() > 4 && base.substr(base.size() - 4) == ".png") {
     base = base.substr(0, base.size() - 4);
   }
+  const std::string lower_base = ToLowerAscii(base);
+  std::vector<std::string> base_candidates = {base};
+  if (lower_base != base) {
+    base_candidates.push_back(lower_base);
+  }
 
   const auto data_dirs = GetXdgDataDirs();
   static const char* kThemes[] = {"hicolor", "Adwaita", "gnome", "breeze", "Papirus"};
   static const char* kSizes[] = {"256x256", "512x512", "128x128", "64x64", "48x48", "32x32"};
 
   for (const auto& dir : data_dirs) {
-    for (const char* theme : kThemes) {
-      for (const char* sz : kSizes) {
-        std::string p = dir + "/icons/" + theme + "/" + sz + "/apps/" + base + ".png";
-        if (ReadFileBytes(p, out_png)) return true;
+    for (const auto& cand : base_candidates) {
+      for (const char* theme : kThemes) {
+        for (const char* sz : kSizes) {
+          std::string p = dir + "/icons/" + theme + "/" + sz + "/apps/" + cand + ".png";
+          if (ReadFileBytes(p, out_png)) return true;
+        }
       }
+      if (ReadFileBytes(dir + "/pixmaps/" + cand + ".png", out_png)) return true;
+      if (ReadFileBytes(dir + "/icons/" + cand + ".png", out_png)) return true;
     }
-    if (ReadFileBytes(dir + "/pixmaps/" + base + ".png", out_png)) return true;
-    if (ReadFileBytes(dir + "/icons/" + base + ".png", out_png)) return true;
   }
   return false;
 }
@@ -255,13 +262,20 @@ bool ResolveIconFromClientPid(pid_t pid,
       exe_dir,
   };
 
+  const std::string lower_exe_base = ToLowerAscii(exe_base);
   for (const auto& dir_path : bundle_rel_Dirs) {
+    const bool is_shared_dir = (dir_path.find("../share/") != std::string::npos);
     DIR* d = opendir(dir_path.c_str());
     if (!d) continue;
     struct dirent* ent = nullptr;
     while ((ent = readdir(d)) != nullptr) {
       std::string fname = ent->d_name;
-      if (fname.size() > 4 && ToLowerAscii(fname.substr(fname.size() - 4)) == ".png") {
+      std::string lower_fname = ToLowerAscii(fname);
+      if (fname.size() > 4 && lower_fname.substr(lower_fname.size() - 4) == ".png") {
+        if (is_shared_dir && !lower_exe_base.empty() &&
+            lower_fname.find(lower_exe_base) == std::string::npos) {
+          continue;
+        }
         std::string full = dir_path + "/" + fname;
         if (ReadFileBytes(full, out_png)) {
           closedir(d);
@@ -274,6 +288,103 @@ bool ResolveIconFromClientPid(pid_t pid,
     closedir(d);
   }
   return false;
+}
+
+// When an X11 application is running inside a rootful Xwayland server (e.g. "Xwayland on :15"),
+// inspects /proc/*/environ for a GUI client connected to that DISPLAY and resolves its real
+// application Name and .desktop ID (e.g. "TeamViewer" / "com.teamviewer.TeamViewer").
+bool ResolveXwaylandClientMetadata(const std::string& xwayland_display,
+                                   std::string* out_title,
+                                   std::string* out_app_id) {
+  if (xwayland_display.empty()) return false;
+  const std::string target_env = "DISPLAY=" + xwayland_display;
+
+  DIR* proc_d = opendir("/proc");
+  if (!proc_d) return false;
+
+  std::string matched_exe_path;
+  std::string matched_exe_base;
+  struct dirent* ent = nullptr;
+  while ((ent = readdir(proc_d)) != nullptr) {
+    const char* name = ent->d_name;
+    if (name[0] < '1' || name[0] > '9') continue;
+    pid_t pid = static_cast<pid_t>(std::atoi(name));
+    if (pid <= 0) continue;
+
+    std::string env_path = std::string("/proc/") + name + "/environ";
+    int fd = open(env_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) continue;
+    char buf[8192];
+    ssize_t n = read(fd, buf, sizeof(buf));
+    close(fd);
+    if (n <= 0) continue;
+
+    bool has_display = false;
+    for (ssize_t i = 0; i < n;) {
+      std::string var(buf + i);
+      i += static_cast<ssize_t>(var.size()) + 1;
+      if (var == target_env) {
+        has_display = true;
+        break;
+      }
+    }
+    if (!has_display) continue;
+
+    char link_buf[4096] = {};
+    std::string proc_exe = std::string("/proc/") + name + "/exe";
+    ssize_t len = readlink(proc_exe.c_str(), link_buf, sizeof(link_buf) - 1);
+    if (len <= 0) continue;
+    std::string exe_path(link_buf, static_cast<size_t>(len));
+    size_t slash = exe_path.find_last_of('/');
+    std::string exe_base = (slash != std::string::npos) ? exe_path.substr(slash + 1) : exe_path;
+    std::string low_base = ToLowerAscii(exe_base);
+
+    if (low_base == "xwayland" || low_base == "xkbcomp" || low_base == "sh" ||
+        low_base == "bash" || low_base == "dash" || low_base.rfind("python", 0) == 0 ||
+        low_base == "weston" || low_base == "openbox" || low_base == "env" ||
+        low_base == "timeout") {
+      continue;
+    }
+
+    matched_exe_path = exe_path;
+    matched_exe_base = exe_base;
+    break;
+  }
+  closedir(proc_d);
+
+  if (matched_exe_base.empty()) return false;
+
+  const std::string low_exe_base = ToLowerAscii(matched_exe_base);
+  const auto data_dirs = GetXdgDataDirs();
+  for (const auto& base_dir : data_dirs) {
+    std::string app_dir = base_dir + "/applications";
+    DIR* d = opendir(app_dir.c_str());
+    if (!d) continue;
+    struct dirent* dent = nullptr;
+    while ((dent = readdir(d)) != nullptr) {
+      std::string fname = dent->d_name;
+      if (fname.size() <= 8 || fname.substr(fname.size() - 8) != ".desktop") continue;
+      DesktopEntryInfo info;
+      if (!ParseDesktopFile(app_dir + "/" + fname, fname, &info)) continue;
+
+      std::string id_low = ToLowerAscii(info.desktop_id);
+      std::string name_low = ToLowerAscii(info.name);
+      std::string exec_low = ToLowerAscii(info.exec);
+      if (id_low.find(low_exe_base) != std::string::npos ||
+          name_low == low_exe_base ||
+          exec_low.find(low_exe_base) != std::string::npos) {
+        if (out_title && !info.name.empty()) *out_title = info.name;
+        if (out_app_id && !info.desktop_id.empty()) *out_app_id = info.desktop_id;
+        closedir(d);
+        return true;
+      }
+    }
+    closedir(d);
+  }
+
+  if (out_title) *out_title = matched_exe_base;
+  if (out_app_id) *out_app_id = low_exe_base;
+  return true;
 }
 
 // Agnostically resolves any Linux Wayland application's PNG icon using:
@@ -475,9 +586,12 @@ xkb_keycodes "vkwlf_evdev" {
     <HOME> = 110; <UP> = 111; <PGUP> = 112; <LEFT> = 113; <RGHT> = 114;
     <END>  = 115; <DOWN> = 116; <PGDN> = 117; <INS> = 118; <DELE> = 119;
     <LWIN> = 133;
+    indicator 1 = "Caps Lock";
+    indicator 2 = "Num Lock";
+    indicator 3 = "Scroll Lock";
 };
 xkb_types "complete" {
-    virtual_modifiers NumLock,Alt,Super;
+    virtual_modifiers NumLock,Alt,Super,ScrollLock;
     type "ONE_LEVEL" {
         modifiers= none;
         level_name[Level1]= "Any";
@@ -497,8 +611,24 @@ xkb_types "complete" {
     };
 };
 xkb_compatibility "complete" {
+    virtual_modifiers NumLock,Alt,Super,ScrollLock;
+    interpret Caps_Lock+AnyOfOrNone(all) {
+        action= LockMods(modifiers=Lock);
+    };
     interpret Any+AnyOf(all) {
         action= SetMods(modifiers=modMapMods,clearLocks);
+    };
+    indicator "Caps Lock" {
+        whichModState= locked;
+        modifiers= Lock;
+    };
+    indicator "Num Lock" {
+        whichModState= locked;
+        modifiers= NumLock;
+    };
+    indicator "Scroll Lock" {
+        whichModState= locked;
+        modifiers= ScrollLock;
     };
 };
 xkb_symbols "pc_us" {
@@ -674,6 +804,7 @@ struct SurfaceState {
   int32_t geom_x = 0, geom_y = 0, geom_w = 0, geom_h = 0;
   std::string title = "WaylandApp";
   std::string app_id = "wayland.app";
+  std::string xwayland_display;
   std::string last_notified_title;
   std::string last_resolved_app_id;
   std::vector<uint8_t> icon_png;
@@ -1074,6 +1205,23 @@ void SurfaceCommit(struct wl_client* /*client*/, struct wl_resource* resource) {
     frame.is_subsurface = surf->is_subsurface;
 
     if (surf->xdg_toplevel_resource != nullptr) {
+      if (surf->xwayland_display.empty() && surf->title.rfind("Xwayland on :", 0) == 0) {
+        surf->xwayland_display = TrimAscii(surf->title.substr(12));
+      }
+      if (!surf->xwayland_display.empty() &&
+          (surf->app_id.empty() || surf->app_id == "org.freedesktop.Xwayland" ||
+           surf->title.rfind("Xwayland on :", 0) == 0)) {
+        std::string resolved_x_title;
+        std::string resolved_x_app_id;
+        if (ResolveXwaylandClientMetadata(surf->xwayland_display, &resolved_x_title,
+                                          &resolved_x_app_id)) {
+          surf->title = resolved_x_title;
+          surf->app_id = resolved_x_app_id;
+          frame.title = surf->title;
+          frame.app_id = surf->app_id;
+        }
+      }
+
       if (surf->icon_png.empty() || surf->app_id != surf->last_resolved_app_id) {
         auto resolved = ResolveLinuxAppIconPng(wl_resource_get_client(resource), surf->app_id,
                                                surf->title);
@@ -1083,12 +1231,17 @@ void SurfaceCommit(struct wl_client* /*client*/, struct wl_resource* resource) {
           surf->icon_frames_sent = 0;
         }
       }
+      if (!surf->icon_png.empty()) {
+        frame.icon_png = surf->icon_png;
+      }
+      const bool is_unresolved_xwayland =
+          (!surf->xwayland_display.empty() && surf->app_id == "org.freedesktop.Xwayland");
       const bool title_changed = (surf->title != surf->last_notified_title);
-      if (!surf->app_launch_notified || title_changed || surf->icon_frames_sent < 4) {
+      if (!is_unresolved_xwayland &&
+          (!surf->app_launch_notified || title_changed || surf->icon_frames_sent < 4)) {
         surf->app_launch_notified = true;
         surf->last_notified_title = surf->title;
         if (!surf->icon_png.empty()) {
-          frame.icon_png = surf->icon_png;
           surf->icon_frames_sent++;
         }
         if (title_changed || surf->icon_frames_sent <= 1) {
@@ -1131,10 +1284,12 @@ void SurfaceCommit(struct wl_client* /*client*/, struct wl_resource* resource) {
         crop_w = static_cast<uint32_t>(surf->geom_w);
         crop_h = static_cast<uint32_t>(surf->geom_h);
       }
-      if (surf->xdg_toplevel_resource != nullptr && surf->parent_surface_id == 0 &&
-          crop_w >= (engine->config().display_width * 3) / 4 &&
-          crop_h >= (engine->config().display_height * 3) / 4) {
-        engine->SetToplevelGeometry(crop_x, crop_y, crop_w, crop_h);
+      if (surf->xdg_toplevel_resource != nullptr && surf->parent_surface_id == 0) {
+        engine->RecordSurfaceGeometry(surf->id, crop_x, crop_y, crop_w, crop_h);
+        if (crop_w >= (engine->config().display_width * 3) / 4 &&
+            crop_h >= (engine->config().display_height * 3) / 4) {
+          engine->SetToplevelGeometry(crop_x, crop_y, crop_w, crop_h);
+        }
       }
 
       wl_shm_buffer_begin_access(shm_buf);
@@ -1220,10 +1375,12 @@ void SurfaceCommit(struct wl_client* /*client*/, struct wl_resource* resource) {
           crop_w = static_cast<uint32_t>(surf->geom_w);
           crop_h = static_cast<uint32_t>(surf->geom_h);
         }
-        if (surf->xdg_toplevel_resource != nullptr && surf->parent_surface_id == 0 &&
-            crop_w >= (engine->config().display_width * 3) / 4 &&
-            crop_h >= (engine->config().display_height * 3) / 4) {
-          engine->SetToplevelGeometry(crop_x, crop_y, crop_w, crop_h);
+        if (surf->xdg_toplevel_resource != nullptr && surf->parent_surface_id == 0) {
+          engine->RecordSurfaceGeometry(surf->id, crop_x, crop_y, crop_w, crop_h);
+          if (crop_w >= (engine->config().display_width * 3) / 4 &&
+              crop_h >= (engine->config().display_height * 3) / 4) {
+            engine->SetToplevelGeometry(crop_x, crop_y, crop_w, crop_h);
+          }
         }
 
         const bool is_ahb_handle =
@@ -2521,8 +2678,9 @@ void WaylandServerEngine::ForwardInputCommandToBridgeClients(const InputCommand&
   pkt.mods_locked = cmd.mods_locked;
   pkt.group = cmd.group;
   if (cmd.type != InputCommand::Type::kKeyboardModifiers) {
-    pkt.mods_latched = config_.display_width;
-    pkt.group = config_.display_height;
+    pkt.mods_locked = cmd.target_surface_id;
+    pkt.mods_latched = cmd.host_width > 0 ? cmd.host_width : config_.display_width;
+    pkt.group = cmd.host_height > 0 ? cmd.host_height : config_.display_height;
   }
 
   std::lock_guard<std::mutex> lock(bridge_clients_mutex_);
@@ -2539,24 +2697,32 @@ bool WaylandServerEngine::ProcessBridgeInputFromHost(int sock_fd) {
     return false;
   }
   auto type = static_cast<InputCommand::Type>(pkt.type);
-  if (type != InputCommand::Type::kKeyboardModifiers &&
-      pkt.mods_latched > 0 && pkt.group > 0) {
-    uint32_t hw = pkt.mods_latched;
-    uint32_t hh = pkt.group;
-    if (hw != host_display_width_ || hh != host_display_height_) {
-      host_display_width_ = hw;
-      host_display_height_ = hh;
-      SetDisplaySize(hw, hh);
+  uint32_t target_sid = 0;
+  uint32_t pkt_hw = 0;
+  uint32_t pkt_hh = 0;
+  if (type != InputCommand::Type::kKeyboardModifiers) {
+    target_sid = pkt.mods_locked;
+    pkt_hw = pkt.mods_latched;
+    pkt_hh = pkt.group;
+    if (pkt_hw > 0 && pkt_hh > 0) {
+      host_display_width_ = pkt_hw;
+      host_display_height_ = pkt_hh;
     }
+    SetActiveInputSurface(target_sid, pkt_hw, pkt_hh);
   }
   switch (type) {
     case InputCommand::Type::kPointerMotion: {
       double mx = pkt.x;
       double my = pkt.y;
-      uint32_t hw = host_display_width_.load();
-      uint32_t hh = host_display_height_.load();
+      uint32_t hw = pkt_hw > 0 ? pkt_hw : host_display_width_.load();
+      uint32_t hh = pkt_hh > 0 ? pkt_hh : host_display_height_.load();
+      int32_t cx = last_crop_x_.load();
+      int32_t cy = last_crop_y_.load();
       uint32_t cw = last_crop_w_.load();
       uint32_t ch = last_crop_h_.load();
+      if (target_sid != 0) {
+        GetSurfaceGeometry(target_sid, &cx, &cy, &cw, &ch);
+      }
       uint32_t host_w = hw > 0 ? hw : config_.display_width;
       uint32_t host_h = hh > 0 ? hh : config_.display_height;
       uint32_t surf_w = cw > 0 ? cw : config_.display_width;
@@ -2567,8 +2733,8 @@ bool WaylandServerEngine::ProcessBridgeInputFromHost(int sock_fd) {
       if (host_h > 0 && surf_h > 0 && host_h != surf_h) {
         my = (my * static_cast<double>(surf_h)) / static_cast<double>(host_h);
       }
-      mx += static_cast<double>(last_crop_x_.load());
-      my += static_cast<double>(last_crop_y_.load());
+      mx += static_cast<double>(cx);
+      my += static_cast<double>(cy);
       SendPointerMotion(pkt.time_ms, mx, my);
       break;
     }
@@ -2584,14 +2750,18 @@ bool WaylandServerEngine::ProcessBridgeInputFromHost(int sock_fd) {
     case InputCommand::Type::kKeyboardModifiers:
       SendKeyboardModifiers(pkt.mods_depressed, pkt.mods_latched, pkt.mods_locked, pkt.group);
       break;
+    case InputCommand::Type::kFocusSurface:
+      FocusSurfaceById(target_sid != 0 ? target_sid : pkt.button_or_key);
+      break;
     case InputCommand::Type::kDisplayResize: {
       uint32_t rw = static_cast<uint32_t>(pkt.x);
       uint32_t rh = static_cast<uint32_t>(pkt.y);
       if (rw > 0 && rh > 0) {
-        LOGI(kTag, "Received host display resize over bridge: %ux%u", rw, rh);
+        LOGI(kTag, "Received host display resize over bridge: %ux%u (surface=%u)", rw, rh,
+             target_sid);
         host_display_width_ = rw;
         host_display_height_ = rh;
-        SetDisplaySize(rw, rh);
+        SetDisplaySizeForSurface(target_sid, rw, rh);
       }
       break;
     }
@@ -2742,23 +2912,50 @@ void WaylandServerEngine::ProcessPendingInputCommands() {
     // Forward input/resize commands to any connected remote guest bridge proxies
     ForwardInputCommandToBridgeClients(cmd);
 
+    if (cmd.target_surface_id != 0) {
+      for (const auto& entry : toplevel_entries_) {
+        if (!entry.surface_res) continue;
+        auto* surf = static_cast<SurfaceState*>(wl_resource_get_user_data(entry.surface_res));
+        if (surf && surf->id == cmd.target_surface_id) {
+          preferred_base_surface_ = entry.surface_res;
+          if (!focused_surface_ ||
+              wl_resource_get_client(focused_surface_) !=
+                  wl_resource_get_client(entry.surface_res)) {
+            SetFocusedSurface(entry.surface_res);
+          }
+          break;
+        }
+      }
+    }
+
+    if (cmd.type == InputCommand::Type::kFocusSurface) {
+      continue;
+    }
+
     if (cmd.type == InputCommand::Type::kDisplayResize) {
+      uint32_t target_w = cmd.x > 0 ? static_cast<uint32_t>(cmd.x) : config_.display_width;
+      uint32_t target_h = cmd.y > 0 ? static_cast<uint32_t>(cmd.y) : config_.display_height;
       for (const auto& entry : toplevel_entries_) {
         if (entry.xdg_toplevel_res && entry.xdg_surface_res) {
+          if (cmd.target_surface_id != 0 && entry.surface_res) {
+            auto* surf = static_cast<SurfaceState*>(wl_resource_get_user_data(entry.surface_res));
+            if (surf && surf->id != cmd.target_surface_id) {
+              continue;
+            }
+          }
           struct wl_array states;
           wl_array_init(&states);
           auto* act = static_cast<uint32_t*>(wl_array_add(&states, sizeof(uint32_t)));
           if (act) *act = XDG_TOPLEVEL_STATE_ACTIVATED;
           auto* max_st = static_cast<uint32_t*>(wl_array_add(&states, sizeof(uint32_t)));
           if (max_st) *max_st = XDG_TOPLEVEL_STATE_MAXIMIZED;
-          xdg_toplevel_send_configure(entry.xdg_toplevel_res,
-                                      static_cast<int32_t>(config_.display_width),
-                                      static_cast<int32_t>(config_.display_height), &states);
+          xdg_toplevel_send_configure(entry.xdg_toplevel_res, static_cast<int32_t>(target_w),
+                                      static_cast<int32_t>(target_h), &states);
           wl_array_release(&states);
           uint32_t serial = NextSerial();
           xdg_surface_send_configure(entry.xdg_surface_res, serial);
-          LOGI(kTag, "Reconfigured toplevel surface to %ux%u (serial=%u)",
-               config_.display_width, config_.display_height, serial);
+          LOGI(kTag, "Reconfigured toplevel surface (target=%u) to %ux%u (serial=%u)",
+               cmd.target_surface_id, target_w, target_h, serial);
         }
       }
       continue;
@@ -3043,6 +3240,9 @@ void WaylandServerEngine::SendPointerMotion(uint32_t time_ms, double x, double y
       .time_ms = time_ms,
       .x = x,
       .y = y,
+      .target_surface_id = active_input_surface_id_.load(),
+      .host_width = active_input_width_.load(),
+      .host_height = active_input_height_.load(),
   });
 }
 
@@ -3052,6 +3252,9 @@ void WaylandServerEngine::SendPointerButton(uint32_t time_ms, uint32_t button, u
       .time_ms = time_ms,
       .button_or_key = button,
       .state = state,
+      .target_surface_id = active_input_surface_id_.load(),
+      .host_width = active_input_width_.load(),
+      .host_height = active_input_height_.load(),
   });
 }
 
@@ -3061,6 +3264,9 @@ void WaylandServerEngine::SendPointerAxis(uint32_t time_ms, uint32_t axis, doubl
       .time_ms = time_ms,
       .x = value,
       .button_or_key = axis,
+      .target_surface_id = active_input_surface_id_.load(),
+      .host_width = active_input_width_.load(),
+      .host_height = active_input_height_.load(),
   });
 }
 
@@ -3070,6 +3276,9 @@ void WaylandServerEngine::SendKeyboardKey(uint32_t time_ms, uint32_t key, uint32
       .time_ms = time_ms,
       .button_or_key = key,
       .state = state,
+      .target_surface_id = active_input_surface_id_.load(),
+      .host_width = active_input_width_.load(),
+      .host_height = active_input_height_.load(),
   });
 }
 
@@ -3083,10 +3292,17 @@ void WaylandServerEngine::SendKeyboardModifiers(uint32_t mods_depressed,
       .mods_latched = mods_latched,
       .mods_locked = mods_locked,
       .group = group,
+      .target_surface_id = active_input_surface_id_.load(),
   });
 }
 
 void WaylandServerEngine::SetDisplaySize(uint32_t width, uint32_t height) {
+  SetDisplaySizeForSurface(0, width, height);
+}
+
+void WaylandServerEngine::SetDisplaySizeForSurface(uint32_t surface_id,
+                                                   uint32_t width,
+                                                   uint32_t height) {
   if (width == 0 || height == 0) return;
   config_.display_width = width;
   config_.display_height = height;
@@ -3094,6 +3310,29 @@ void WaylandServerEngine::SetDisplaySize(uint32_t width, uint32_t height) {
       .type = InputCommand::Type::kDisplayResize,
       .x = static_cast<double>(width),
       .y = static_cast<double>(height),
+      .target_surface_id = surface_id,
+      .host_width = width,
+      .host_height = height,
+  });
+}
+
+void WaylandServerEngine::SetActiveInputSurface(uint32_t surface_id,
+                                                uint32_t host_width,
+                                                uint32_t host_height) {
+  active_input_surface_id_.store(surface_id);
+  if (host_width > 0) active_input_width_.store(host_width);
+  if (host_height > 0) active_input_height_.store(host_height);
+}
+
+void WaylandServerEngine::FocusSurfaceById(uint32_t surface_id) {
+  if (surface_id == 0) return;
+  active_input_surface_id_.store(surface_id);
+  EnqueueInputCommand(InputCommand{
+      .type = InputCommand::Type::kFocusSurface,
+      .button_or_key = surface_id,
+      .target_surface_id = surface_id,
+      .host_width = active_input_width_.load(),
+      .host_height = active_input_height_.load(),
   });
 }
 
@@ -3105,6 +3344,36 @@ void WaylandServerEngine::SetToplevelGeometry(int32_t crop_x,
   last_crop_y_ = crop_y;
   if (crop_w > 0) last_crop_w_ = crop_w;
   if (crop_h > 0) last_crop_h_ = crop_h;
+}
+
+void WaylandServerEngine::RecordSurfaceGeometry(uint32_t surface_id,
+                                                int32_t crop_x,
+                                                int32_t crop_y,
+                                                uint32_t crop_w,
+                                                uint32_t crop_h) {
+  if (surface_id == 0 || crop_w == 0 || crop_h == 0) return;
+  std::lock_guard<std::mutex> lock(surface_geom_mutex_);
+  surface_geometries_[surface_id] = SurfaceGeomInfo{
+      .crop_x = crop_x,
+      .crop_y = crop_y,
+      .crop_w = crop_w,
+      .crop_h = crop_h,
+  };
+}
+
+bool WaylandServerEngine::GetSurfaceGeometry(uint32_t surface_id,
+                                             int32_t* out_crop_x,
+                                             int32_t* out_crop_y,
+                                             uint32_t* out_crop_w,
+                                             uint32_t* out_crop_h) const {
+  std::lock_guard<std::mutex> lock(surface_geom_mutex_);
+  auto it = surface_geometries_.find(surface_id);
+  if (it == surface_geometries_.end()) return false;
+  if (out_crop_x) *out_crop_x = it->second.crop_x;
+  if (out_crop_y) *out_crop_y = it->second.crop_y;
+  if (out_crop_w) *out_crop_w = it->second.crop_w;
+  if (out_crop_h) *out_crop_h = it->second.crop_h;
+  return true;
 }
 
 uint32_t WaylandServerEngine::NextSerial() {
@@ -3204,6 +3473,13 @@ void WaylandServerEngine::UnregisterToplevelSurface(struct wl_resource* xdg_topl
 void WaylandServerEngine::OnSurfaceUnmappedOrDestroyed(struct wl_resource* surface_res,
                                                        uint32_t surface_id,
                                                        bool was_drawable) {
+  if (preferred_base_surface_ == surface_res) {
+    preferred_base_surface_ = nullptr;
+  }
+  if (surface_id != 0) {
+    std::lock_guard<std::mutex> lock(surface_geom_mutex_);
+    surface_geometries_.erase(surface_id);
+  }
   if (focused_surface_ == surface_res) {
     struct wl_resource* fallback = nullptr;
     if (!toplevel_entries_.empty()) {
@@ -3238,9 +3514,12 @@ struct wl_resource* WaylandServerEngine::ResolvePointerTarget(double screen_x,
       continue;
     }
     mapped_count++;
-    if (!base_surface ||
-        (surf->committed_width >= (config_.display_width * 3) / 4 &&
-         surf->committed_height >= (config_.display_height * 3) / 4)) {
+    if (entry.surface_res == preferred_base_surface_) {
+      base_surface = entry.surface_res;
+    } else if (base_surface != preferred_base_surface_ &&
+               (!base_surface ||
+                (surf->committed_width >= (config_.display_width * 3) / 4 &&
+                 surf->committed_height >= (config_.display_height * 3) / 4))) {
       base_surface = entry.surface_res;
     }
   }
@@ -3248,6 +3527,10 @@ struct wl_resource* WaylandServerEngine::ResolvePointerTarget(double screen_x,
   if (mapped_count > 1) {
     for (auto it = toplevel_entries_.rbegin(); it != toplevel_entries_.rend(); ++it) {
       if (!it->surface_res) continue;
+      if (base_surface &&
+          wl_resource_get_client(it->surface_res) != wl_resource_get_client(base_surface)) {
+        continue;
+      }
       auto* surf = static_cast<SurfaceState*>(wl_resource_get_user_data(it->surface_res));
       if (!surf || !surf->has_committed_buffer || surf->committed_width == 0 ||
           surf->committed_height == 0) {

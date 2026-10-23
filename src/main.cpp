@@ -1,11 +1,18 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <vector>
+#include <unistd.h>
 
 #ifdef __ANDROID__
 #include <android/input.h>
@@ -26,35 +33,338 @@ std::atomic<bool> g_keep_running{true};
 
 void SignalHandler(int /*sig*/) { g_keep_running.store(false); }
 
+struct WindowSlot {
+  ANativeWindow* window = nullptr;
+  std::unique_ptr<vkwlf::VkRenderer> renderer;
+  uint32_t width = 1280;
+  uint32_t height = 720;
+  uint32_t target_surface_id = 0;
+  bool user_pinned_surface = false;
+#ifdef __ANDROID__
+  jobject activity_global = nullptr;
+  std::string last_notified_app_key;
+  bool last_notified_has_icon = false;
+#endif
+};
+
 struct AppBridgeState {
   std::unique_ptr<vkwlf::WaylandServerEngine> server;
-  std::mutex renderer_mutex;
-  std::unique_ptr<vkwlf::VkRenderer> renderer;
   std::unique_ptr<vkwlf::InputHandler> input;
-  std::thread render_thread;
-  std::atomic<bool> render_running{false};
-  std::atomic<uint32_t> latest_width{0};
-  std::atomic<uint32_t> latest_height{0};
-  ANativeWindow* window = nullptr;
+  std::mutex slots_mutex;
+  std::map<int, WindowSlot> slots;
+  std::atomic<int> next_dynamic_slot_id{2};
+  std::thread pump_thread;
+  std::atomic<bool> pump_running{false};
   std::mutex cache_mutex;
-  std::unordered_map<uint32_t, vkwlf::CommittedFrame> cached_frames;
+  std::map<uint32_t, vkwlf::CommittedFrame> cached_frames;
 #ifdef __ANDROID__
   JavaVM* jvm = nullptr;
   jobject app_launch_listener_global = nullptr;
-  jobject main_activity_global = nullptr;
-  std::string last_overlay_app_id;
-  bool overlay_icon_sent = false;
 #endif
 };
 
 AppBridgeState g_app;
 
-void NotifyAndroidAppInfo(uint32_t surface_id,
-                          const std::string& title,
-                          const std::string& app_id,
-                          const std::vector<uint8_t>& icon_png) {
+vkwlf::CommittedFrame CloneFrameForRenderer(const vkwlf::CommittedFrame& src) {
+  vkwlf::CommittedFrame copy = src;
+  copy.dmabuf_fd = (src.dmabuf_fd >= 0) ? dup(src.dmabuf_fd) : -1;
+  copy.planes.clear();
+  for (const auto& p : src.planes) {
+    copy.planes.push_back(vkwlf::DmaBufPlane{
+        .fd = (p.fd >= 0) ? dup(p.fd) : -1,
+        .offset = p.offset,
+        .stride = p.stride,
+        .modifier = p.modifier,
+    });
+  }
+  return copy;
+}
+
+bool IsBaseToplevelFrame(const vkwlf::CommittedFrame& f) {
+  return !f.is_popup && !f.is_subsurface && !f.is_unmapped && f.parent_surface_id == 0 &&
+         f.width >= 320 && f.height >= 240;
+}
+
+void NotifySlotAppInfo(int slot_idx,
+                       uint32_t surface_id,
+                       const std::string& title,
+                       const std::string& app_id,
+                       const std::vector<uint8_t>& icon_png,
+                       bool force_notify = false) {
+#ifdef __ANDROID__
+  if (!g_app.jvm || slot_idx < 0) return;
+  JNIEnv* env = nullptr;
+  bool attached = false;
+  if (g_app.jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+    if (g_app.jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+      attached = true;
+    }
+  }
+  if (!env) return;
+
+  jobject activity_ref = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+    auto it = g_app.slots.find(slot_idx);
+    if (it == g_app.slots.end() || !it->second.activity_global) {
+      if (attached) g_app.jvm->DetachCurrentThread();
+      return;
+    }
+    WindowSlot& slot = it->second;
+    const std::string app_key =
+        std::to_string(surface_id) + "|" + (!app_id.empty() ? app_id : title) + "|" + title;
+    const bool has_icon = !icon_png.empty();
+    const bool need_update =
+        force_notify || (app_key != slot.last_notified_app_key) ||
+        (!slot.last_notified_has_icon && has_icon);
+    if (!need_update) {
+      if (attached) g_app.jvm->DetachCurrentThread();
+      return;
+    }
+    slot.last_notified_app_key = app_key;
+    if (has_icon) {
+      slot.last_notified_has_icon = true;
+    }
+    activity_ref = env->NewLocalRef(slot.activity_global);
+  }
+
+  if (activity_ref) {
+    jstring j_title = env->NewStringUTF(title.c_str());
+    jstring j_app_id = env->NewStringUTF(app_id.c_str());
+    jbyteArray j_icon = nullptr;
+    if (!icon_png.empty()) {
+      j_icon = env->NewByteArray(static_cast<jsize>(icon_png.size()));
+      if (j_icon) {
+        env->SetByteArrayRegion(j_icon, 0, static_cast<jsize>(icon_png.size()),
+                                reinterpret_cast<const jbyte*>(icon_png.data()));
+      }
+    }
+
+    jclass act_cls = env->GetObjectClass(activity_ref);
+    if (act_cls) {
+      jmethodID mid = env->GetMethodID(
+          act_cls, "onWaylandAppInfo", "(ILjava/lang/String;Ljava/lang/String;[B)V");
+      if (mid) {
+        env->CallVoidMethod(activity_ref, mid, static_cast<jint>(surface_id), j_title, j_app_id,
+                            j_icon);
+      } else {
+        env->ExceptionClear();
+      }
+      env->DeleteLocalRef(act_cls);
+    }
+
+    if (j_icon) env->DeleteLocalRef(j_icon);
+    env->DeleteLocalRef(j_title);
+    env->DeleteLocalRef(j_app_id);
+    env->DeleteLocalRef(activity_ref);
+  }
+
+  if (attached) {
+    g_app.jvm->DetachCurrentThread();
+  }
+#else
+  (void)slot_idx;
+  (void)surface_id;
+  (void)title;
+  (void)app_id;
+  (void)icon_png;
+  (void)force_notify;
+#endif
+}
+
+void NotifyAllActivitiesAppsList() {
 #ifdef __ANDROID__
   if (!g_app.jvm) return;
+  JNIEnv* env = nullptr;
+  bool attached = false;
+  if (g_app.jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+    if (g_app.jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+      attached = true;
+    }
+  }
+  if (!env) return;
+
+  struct AppEntry {
+    uint32_t surface_id;
+    std::string title;
+    std::string app_id;
+  };
+  std::vector<AppEntry> apps;
+  {
+    std::lock_guard<std::mutex> lock(g_app.cache_mutex);
+    for (const auto& [sid, frame] : g_app.cached_frames) {
+      if (IsBaseToplevelFrame(frame)) {
+        apps.push_back(AppEntry{sid, frame.title, frame.app_id});
+      }
+    }
+  }
+
+  jsize count = static_cast<jsize>(apps.size());
+  jintArray j_sids = env->NewIntArray(count);
+  jclass str_cls = env->FindClass("java/lang/String");
+  jobjectArray j_titles = env->NewObjectArray(count, str_cls, env->NewStringUTF(""));
+  jobjectArray j_app_ids = env->NewObjectArray(count, str_cls, env->NewStringUTF(""));
+
+  std::vector<jint> sid_vals(apps.size());
+  for (size_t i = 0; i < apps.size(); ++i) {
+    sid_vals[i] = static_cast<jint>(apps[i].surface_id);
+    jstring jt = env->NewStringUTF(apps[i].title.c_str());
+    jstring ja = env->NewStringUTF(apps[i].app_id.c_str());
+    env->SetObjectArrayElement(j_titles, static_cast<jsize>(i), jt);
+    env->SetObjectArrayElement(j_app_ids, static_cast<jsize>(i), ja);
+    env->DeleteLocalRef(jt);
+    env->DeleteLocalRef(ja);
+  }
+  if (count > 0) {
+    env->SetIntArrayRegion(j_sids, 0, count, sid_vals.data());
+  }
+
+  std::vector<jobject> activity_refs;
+  std::vector<jint> bound_sids;
+  {
+    std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+    for (const auto& [slot_id, slot] : g_app.slots) {
+      (void)slot_id;
+      if (slot.activity_global) {
+        activity_refs.push_back(env->NewLocalRef(slot.activity_global));
+        bound_sids.push_back(static_cast<jint>(slot.target_surface_id));
+      }
+    }
+  }
+
+  for (size_t i = 0; i < activity_refs.size(); ++i) {
+    jobject act = activity_refs[i];
+    if (!act) continue;
+    jclass act_cls = env->GetObjectClass(act);
+    if (act_cls) {
+      jmethodID mid = env->GetMethodID(
+          act_cls, "onWaylandAppsChanged", "([I[Ljava/lang/String;[Ljava/lang/String;I)V");
+      if (mid) {
+        env->CallVoidMethod(act, mid, j_sids, j_titles, j_app_ids, bound_sids[i]);
+      } else {
+        env->ExceptionClear();
+      }
+      env->DeleteLocalRef(act_cls);
+    }
+    env->DeleteLocalRef(act);
+  }
+
+  env->DeleteLocalRef(j_sids);
+  env->DeleteLocalRef(j_titles);
+  env->DeleteLocalRef(j_app_ids);
+  env->DeleteLocalRef(str_cls);
+
+  if (attached) {
+    g_app.jvm->DetachCurrentThread();
+  }
+#endif
+}
+
+void UpdateSlotAssignmentsAndNotify() {
+  std::vector<vkwlf::CommittedFrame> base_apps;
+  {
+    std::lock_guard<std::mutex> lock(g_app.cache_mutex);
+    for (const auto& [sid, frame] : g_app.cached_frames) {
+      if (IsBaseToplevelFrame(frame)) {
+        base_apps.push_back(frame);
+      }
+    }
+  }
+  if (base_apps.empty()) return;
+
+  // Sort base apps so primary IDE (Antigravity) naturally orders first for Slot 0
+  // and secondary apps (TeamViewer, etc.) order in deterministic surface_id order.
+  std::sort(base_apps.begin(), base_apps.end(),
+            [](const vkwlf::CommittedFrame& a, const vkwlf::CommittedFrame& b) {
+              auto is_primary_ide = [](const vkwlf::CommittedFrame& f) {
+                return f.app_id.find("antigravity") != std::string::npos ||
+                       f.title.find("Antigravity") != std::string::npos;
+              };
+              bool ide_a = is_primary_ide(a);
+              bool ide_b = is_primary_ide(b);
+              if (ide_a != ide_b) return ide_a;
+              return a.surface_id < b.surface_id;
+            });
+
+  struct PendingNotification {
+    int slot_idx;
+    uint32_t surface_id;
+    std::string title;
+    std::string app_id;
+    std::vector<uint8_t> icon_png;
+    bool changed;
+  };
+  std::vector<PendingNotification> notifications;
+
+  {
+    std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+    std::set<uint32_t> claimed_sids;
+    // Pass 1: Honor user-pinned / intent-bound surfaces that are still active.
+    for (auto& [slot_id, slot] : g_app.slots) {
+      (void)slot_id;
+      if (slot.user_pinned_surface && slot.target_surface_id != 0) {
+        for (const auto& app : base_apps) {
+          if (app.surface_id == slot.target_surface_id) {
+            claimed_sids.insert(slot.target_surface_id);
+            break;
+          }
+        }
+      }
+    }
+
+    // Pass 2: Assign each unpinned or invalidated slot to a distinct unclaimed Wayland app.
+    size_t ordinal = 0;
+    for (auto& [slot_id, slot] : g_app.slots) {
+      bool current_valid = false;
+      for (const auto& app : base_apps) {
+        if (app.surface_id == slot.target_surface_id) {
+          current_valid = true;
+          break;
+        }
+      }
+      uint32_t desired_sid = slot.target_surface_id;
+      if (!current_valid || !slot.user_pinned_surface) {
+        uint32_t picked = 0;
+        for (const auto& app : base_apps) {
+          if (claimed_sids.find(app.surface_id) == claimed_sids.end()) {
+            picked = app.surface_id;
+            claimed_sids.insert(picked);
+            break;
+          }
+        }
+        if (picked == 0) {
+          picked = base_apps[ordinal % base_apps.size()].surface_id;
+        }
+        desired_sid = picked;
+      }
+      ordinal++;
+      bool sid_changed = (desired_sid != slot.target_surface_id);
+      slot.target_surface_id = desired_sid;
+      if (slot.renderer) {
+        slot.renderer->SetTargetSurfaceId(desired_sid);
+      }
+      for (const auto& app : base_apps) {
+        if (app.surface_id == desired_sid) {
+          notifications.push_back(PendingNotification{
+              slot_id, app.surface_id, app.title, app.app_id, app.icon_png, sid_changed});
+          break;
+        }
+      }
+    }
+  }
+
+  for (const auto& n : notifications) {
+    NotifySlotAppInfo(n.slot_idx, n.surface_id, n.title, n.app_id, n.icon_png, n.changed);
+  }
+  NotifyAllActivitiesAppsList();
+}
+
+void NotifyExternalAppLaunchListener(uint32_t surface_id,
+                                     const std::string& title,
+                                     const std::string& app_id,
+                                     const std::vector<uint8_t>& icon_png) {
+#ifdef __ANDROID__
+  if (!g_app.jvm || !g_app.app_launch_listener_global) return;
   JNIEnv* env = nullptr;
   bool attached = false;
   if (g_app.jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
@@ -75,52 +385,25 @@ void NotifyAndroidAppInfo(uint32_t surface_id,
     }
   }
 
-  // Only invoke MainActivity.onWaylandAppInfo once per app_id (or when its icon first resolves)
-  // so OverlayManager.commit(FabricatedOverlay) does not repeatedly reload SystemUI resources.
-  const std::string effective_app_id = !app_id.empty() ? app_id : title;
-  const bool need_activity_update =
-      (effective_app_id != g_app.last_overlay_app_id) ||
-      (!g_app.overlay_icon_sent && !icon_png.empty());
-  if (g_app.main_activity_global && need_activity_update) {
-    g_app.last_overlay_app_id = effective_app_id;
-    if (!icon_png.empty()) {
-      g_app.overlay_icon_sent = true;
-    }
-    jclass act_cls = env->GetObjectClass(g_app.main_activity_global);
-    if (act_cls) {
+  jclass cls = env->GetObjectClass(g_app.app_launch_listener_global);
+  if (cls) {
+    jmethodID mid_with_icon = env->GetMethodID(
+        cls, "onWaylandAppLaunched", "(ILjava/lang/String;Ljava/lang/String;[B)V");
+    if (mid_with_icon) {
+      env->CallVoidMethod(g_app.app_launch_listener_global, mid_with_icon,
+                          static_cast<jint>(surface_id), j_title, j_app_id, j_icon);
+    } else {
+      env->ExceptionClear();
       jmethodID mid = env->GetMethodID(
-          act_cls, "onWaylandAppInfo", "(ILjava/lang/String;Ljava/lang/String;[B)V");
+          cls, "onWaylandAppLaunched", "(ILjava/lang/String;Ljava/lang/String;)V");
       if (mid) {
-        env->CallVoidMethod(g_app.main_activity_global, mid, static_cast<jint>(surface_id),
-                            j_title, j_app_id, j_icon);
+        env->CallVoidMethod(g_app.app_launch_listener_global, mid,
+                            static_cast<jint>(surface_id), j_title, j_app_id);
       } else {
         env->ExceptionClear();
       }
-      env->DeleteLocalRef(act_cls);
     }
-  }
-
-  if (g_app.app_launch_listener_global) {
-    jclass cls = env->GetObjectClass(g_app.app_launch_listener_global);
-    if (cls) {
-      jmethodID mid_with_icon = env->GetMethodID(
-          cls, "onWaylandAppLaunched", "(ILjava/lang/String;Ljava/lang/String;[B)V");
-      if (mid_with_icon) {
-        env->CallVoidMethod(g_app.app_launch_listener_global, mid_with_icon,
-                            static_cast<jint>(surface_id), j_title, j_app_id, j_icon);
-      } else {
-        env->ExceptionClear();
-        jmethodID mid = env->GetMethodID(
-            cls, "onWaylandAppLaunched", "(ILjava/lang/String;Ljava/lang/String;)V");
-        if (mid) {
-          env->CallVoidMethod(g_app.app_launch_listener_global, mid,
-                              static_cast<jint>(surface_id), j_title, j_app_id);
-        } else {
-          env->ExceptionClear();
-        }
-      }
-      env->DeleteLocalRef(cls);
-    }
+    env->DeleteLocalRef(cls);
   }
 
   if (j_icon) env->DeleteLocalRef(j_icon);
@@ -138,158 +421,334 @@ void NotifyAndroidAppInfo(uint32_t surface_id,
 #endif
 }
 
-void EnsureServerStarted(const std::string& socket_path,
-                         int vsock_port,
-                         int tcp_port,
-                         uint32_t width,
-                         uint32_t height) {
-  if (g_app.server) {
-    g_app.server->SetDisplaySize(width, height);
-    return;
+void EnsureServerAndPumpStarted(const std::string& socket_path,
+                                int vsock_port,
+                                int tcp_port,
+                                uint32_t width,
+                                uint32_t height) {
+  if (!g_app.server) {
+    vkwlf::WaylandServerEngine::Config srv_cfg;
+    srv_cfg.socket_path = socket_path;
+    srv_cfg.vsock_port = vsock_port;
+    srv_cfg.tcp_port = tcp_port;
+    srv_cfg.display_width = width;
+    srv_cfg.display_height = height;
+
+    g_app.server = std::make_unique<vkwlf::WaylandServerEngine>(srv_cfg);
+    g_app.server->SetAppLaunchedCallback(
+        [](uint32_t surface_id, const std::string& title, const std::string& app_id,
+           const std::vector<uint8_t>& icon_png) {
+          LOGI(kTag,
+               "[AutoForeground] Guest Wayland application launched/updated: surface=%u title='%s' "
+               "app_id='%s' icon_bytes=%zu",
+               surface_id, title.c_str(), app_id.c_str(), icon_png.size());
+          NotifyExternalAppLaunchListener(surface_id, title, app_id, icon_png);
+        });
+
+    if (g_app.server->Initialize()) {
+      g_app.server->Start();
+    }
+    g_app.input = std::make_unique<vkwlf::InputHandler>(g_app.server.get());
   }
 
-  vkwlf::WaylandServerEngine::Config srv_cfg;
-  srv_cfg.socket_path = socket_path;
-  srv_cfg.vsock_port = vsock_port;
-  srv_cfg.tcp_port = tcp_port;
-  srv_cfg.display_width = width;
-  srv_cfg.display_height = height;
-
-  g_app.server = std::make_unique<vkwlf::WaylandServerEngine>(srv_cfg);
-  g_app.server->SetAppLaunchedCallback(
-      [](uint32_t surface_id, const std::string& title, const std::string& app_id,
-         const std::vector<uint8_t>& icon_png) {
-        LOGI(kTag,
-             "[AutoForeground] Guest Wayland application launched/updated: surface=%u title='%s' "
-             "app_id='%s' icon_bytes=%zu",
-             surface_id, title.c_str(), app_id.c_str(), icon_png.size());
-        NotifyAndroidAppInfo(surface_id, title, app_id, icon_png);
-      });
-
-  if (g_app.server->Initialize()) {
-    g_app.server->Start();
-  }
-  g_app.input = std::make_unique<vkwlf::InputHandler>(g_app.server.get());
-}
-
-void StopRenderLoop();
-
-void StartRenderLoop(ANativeWindow* window, uint32_t width, uint32_t height) {
-  StopRenderLoop();
-
-  if (width > 0 && height > 0) {
-    g_app.latest_width.store(width);
-    g_app.latest_height.store(height);
-  }
-  EnsureServerStarted("/data/local/tmp/wayland-0", 5555, 5555, width, height);
-
-  g_app.window = window;
-  g_app.render_running.store(true);
-  g_app.render_thread = std::thread([window, width, height]() {
-    vkwlf::VkRenderer::Config vk_cfg;
-    vk_cfg.width = g_app.latest_width.load() > 0 ? g_app.latest_width.load() : width;
-    vk_cfg.height = g_app.latest_height.load() > 0 ? g_app.latest_height.load() : height;
-    auto local_renderer = std::make_unique<vkwlf::VkRenderer>(vk_cfg);
-    if (!local_renderer->Initialize(window)) {
-      LOGE(kTag, "Failed to initialize VkRenderer on render thread");
-      return;
-    }
-    uint32_t final_w = g_app.latest_width.load();
-    uint32_t final_h = g_app.latest_height.load();
-    if (final_w == 0 || final_h == 0) {
-      final_w = width;
-      final_h = height;
-    }
-    {
-      std::lock_guard<std::mutex> lock(g_app.renderer_mutex);
-      local_renderer->Resize(final_w, final_h);
-      g_app.renderer = std::move(local_renderer);
-    }
-    if (g_app.server) {
-      g_app.server->SetDisplaySize(final_w, final_h);
-    }
-
-    // Immediately replay any cached surface frames if SurfaceView was recreated
-    {
-      std::vector<vkwlf::CommittedFrame> replay_frames;
-      {
-        std::lock_guard<std::mutex> lock(g_app.cache_mutex);
-        for (const auto& [sid, cached] : g_app.cached_frames) {
-          if (!cached.shm_pixels.empty()) {
-            replay_frames.push_back(cached);
-          }
+  if (!g_app.pump_running.exchange(true)) {
+    g_app.pump_thread = std::thread([]() {
+      while (g_app.pump_running.load()) {
+        vkwlf::CommittedFrame frame;
+        if (!g_app.server || !g_app.server->PopCommittedFrame(&frame, 16)) {
+          continue;
         }
-      }
-      std::sort(replay_frames.begin(), replay_frames.end(),
-                [](const vkwlf::CommittedFrame& a, const vkwlf::CommittedFrame& b) {
-                  return a.surface_id < b.surface_id;
-                });
-      std::lock_guard<std::mutex> lock(g_app.renderer_mutex);
-      if (g_app.renderer) {
-        for (const auto& rf : replay_frames) {
-          if (!rf.is_popup && !rf.is_subsurface) {
-            NotifyAndroidAppInfo(rf.surface_id, rf.title, rf.app_id, rf.icon_png);
-          }
-          g_app.renderer->ProcessAndPresentFrame(rf);
-        }
-      }
-    }
-
-    while (g_app.render_running.load()) {
-      vkwlf::CommittedFrame frame;
-      if (g_app.server->PopCommittedFrame(&frame, 16)) {
+        bool topology_or_meta_changed = false;
         {
           std::lock_guard<std::mutex> lock(g_app.cache_mutex);
           if (frame.is_unmapped) {
-            g_app.cached_frames.erase(frame.surface_id);
-          } else if (!frame.shm_pixels.empty()) {
-            // Preserve previously received icon_png across subsequent frames of the same surface
-            if (frame.icon_png.empty()) {
-              auto it = g_app.cached_frames.find(frame.surface_id);
-              if (it != g_app.cached_frames.end() && !it->second.icon_png.empty()) {
+            auto it = g_app.cached_frames.find(frame.surface_id);
+            if (it != g_app.cached_frames.end()) {
+              if (it->second.dmabuf_fd >= 0) close(it->second.dmabuf_fd);
+              for (auto& p : it->second.planes) {
+                if (p.fd >= 0) close(p.fd);
+              }
+              g_app.cached_frames.erase(it);
+              topology_or_meta_changed = true;
+            }
+          } else if (!frame.shm_pixels.empty() || frame.dmabuf_fd >= 0) {
+            auto it = g_app.cached_frames.find(frame.surface_id);
+            if (it == g_app.cached_frames.end()) {
+              topology_or_meta_changed = true;
+            } else {
+              if (frame.icon_png.empty() && !it->second.icon_png.empty()) {
                 frame.icon_png = it->second.icon_png;
+              } else if (!frame.icon_png.empty() && it->second.icon_png.empty()) {
+                topology_or_meta_changed = true;
+              }
+              if (frame.title != it->second.title || frame.app_id != it->second.app_id) {
+                topology_or_meta_changed = true;
+              }
+              if (it->second.dmabuf_fd >= 0) close(it->second.dmabuf_fd);
+              for (auto& p : it->second.planes) {
+                if (p.fd >= 0) close(p.fd);
               }
             }
-            g_app.cached_frames[frame.surface_id] = frame;
+            g_app.cached_frames[frame.surface_id] = CloneFrameForRenderer(frame);
           }
         }
-        std::lock_guard<std::mutex> lock(g_app.renderer_mutex);
-        if (g_app.renderer) {
-          g_app.renderer->ProcessAndPresentFrame(frame);
-          auto stats = g_app.renderer->GetStats();
-          if (stats.presents_succeeded <= 5 || (stats.presents_succeeded % 60 == 0)) {
-            LOGI(kTag,
-                 "[HostGPU] Presented Wayland frame #%llu (surface=%u, buffer_type=%s, "
-                 "shm_uploads=%llu, dmabuf_imports=%llu, presents=%llu)",
-                 static_cast<unsigned long long>(frame.frame_number), frame.surface_id,
-                 frame.buffer_type == vkwlf::BufferType::kDmaBuf ? "DMA-BUF/AHB" : "SHM",
-                 static_cast<unsigned long long>(stats.shm_uploads),
-                 static_cast<unsigned long long>(stats.dmabuf_imports),
-                 static_cast<unsigned long long>(stats.presents_succeeded));
+
+        bool any_slot_unassigned = false;
+        {
+          std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+          for (const auto& [slot_id, slot] : g_app.slots) {
+            (void)slot_id;
+            if (slot.target_surface_id == 0) {
+              any_slot_unassigned = true;
+              break;
+            }
           }
+        }
+        if (topology_or_meta_changed || (any_slot_unassigned && IsBaseToplevelFrame(frame))) {
+          UpdateSlotAssignmentsAndNotify();
+        }
+
+        {
+          std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+          for (auto& [slot_id, slot] : g_app.slots) {
+            if (!slot.renderer) continue;
+            slot.renderer->SetTargetSurfaceId(slot.target_surface_id);
+            vkwlf::CommittedFrame slot_frame = CloneFrameForRenderer(frame);
+            slot.renderer->ProcessAndPresentFrame(slot_frame);
+            auto stats = slot.renderer->GetStats();
+            if (stats.presents_succeeded <= 5 || (stats.presents_succeeded % 60 == 0)) {
+              LOGI(kTag,
+                   "[HostGPU][Slot %d] Presented Wayland frame #%llu (surface=%u, target=%u, "
+                   "buffer_type=%s, shm_uploads=%llu, dmabuf_imports=%llu, presents=%llu)",
+                   slot_id, static_cast<unsigned long long>(frame.frame_number), frame.surface_id,
+                   slot.target_surface_id,
+                   frame.buffer_type == vkwlf::BufferType::kDmaBuf ? "DMA-BUF/AHB" : "SHM",
+                   static_cast<unsigned long long>(stats.shm_uploads),
+                   static_cast<unsigned long long>(stats.dmabuf_imports),
+                   static_cast<unsigned long long>(stats.presents_succeeded));
+            }
+          }
+        }
+
+        if (frame.dmabuf_fd >= 0) close(frame.dmabuf_fd);
+        for (auto& p : frame.planes) {
+          if (p.fd >= 0) close(p.fd);
         }
       }
-    }
-    std::lock_guard<std::mutex> lock(g_app.renderer_mutex);
-    if (g_app.renderer) {
-      g_app.renderer->Shutdown();
-      g_app.renderer.reset();
-    }
-  });
+    });
+  }
 }
 
-void StopRenderLoop() {
-  if (g_app.render_running.exchange(false)) {
-    if (g_app.render_thread.joinable()) {
-      g_app.render_thread.join();
+int AllocateWindowSlot(int preferred_slot) {
+  std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+  if (preferred_slot >= 0) {
+    auto it = g_app.slots.find(preferred_slot);
+    if (it == g_app.slots.end() || it->second.window == nullptr) {
+      g_app.slots[preferred_slot];
+      return preferred_slot;
     }
   }
+  int slot_id = g_app.next_dynamic_slot_id.fetch_add(1);
+  while (g_app.slots.find(slot_id) != g_app.slots.end()) {
+    slot_id = g_app.next_dynamic_slot_id.fetch_add(1);
+  }
+  g_app.slots[slot_id];
+  return slot_id;
+}
+
+void ReleaseWindowSlot(int slot_idx) {
+  if (slot_idx < 0) return;
+  std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+  auto it = g_app.slots.find(slot_idx);
+  if (it == g_app.slots.end()) return;
+  WindowSlot& slot = it->second;
+  if (slot.renderer) {
+    slot.renderer->Shutdown();
+    slot.renderer.reset();
+  }
 #ifdef __ANDROID__
-  if (g_app.window) {
-    ANativeWindow_release(g_app.window);
-    g_app.window = nullptr;
+  if (slot.window) {
+    ANativeWindow_release(slot.window);
+    slot.window = nullptr;
+  }
+  if (g_app.jvm && slot.activity_global) {
+    JNIEnv* env = nullptr;
+    if (g_app.jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_OK && env) {
+      env->DeleteGlobalRef(slot.activity_global);
+    }
+    slot.activity_global = nullptr;
   }
 #endif
+  if (slot_idx >= 2) {
+    g_app.slots.erase(it);
+  }
+}
+
+void AttachWindowSlot(int slot_idx,
+                      void* activity_thiz,
+                      ANativeWindow* window,
+                      uint32_t width,
+                      uint32_t height) {
+  if (slot_idx < 0) return;
+  EnsureServerAndPumpStarted("/data/local/tmp/wayland-0", 5555, 5555, width, height);
+
+  std::vector<vkwlf::CommittedFrame> replay_frames;
+  {
+    std::lock_guard<std::mutex> lock(g_app.cache_mutex);
+    for (const auto& [sid, cached] : g_app.cached_frames) {
+      replay_frames.push_back(CloneFrameForRenderer(cached));
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+    WindowSlot& slot = g_app.slots[slot_idx];
+#ifdef __ANDROID__
+    if (g_app.jvm && activity_thiz) {
+      JNIEnv* env = nullptr;
+      if (g_app.jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_OK && env) {
+        if (slot.activity_global) {
+          env->DeleteGlobalRef(slot.activity_global);
+        }
+        slot.activity_global = env->NewGlobalRef(reinterpret_cast<jobject>(activity_thiz));
+        slot.last_notified_app_key.clear();
+        slot.last_notified_has_icon = false;
+      }
+    }
+#else
+    (void)activity_thiz;
+#endif
+    if (slot.renderer) {
+      slot.renderer->Shutdown();
+      slot.renderer.reset();
+    }
+#ifdef __ANDROID__
+    if (slot.window && slot.window != window) {
+      ANativeWindow_release(slot.window);
+    }
+#endif
+    slot.window = window;
+    slot.width = width > 0 ? width : 1280;
+    slot.height = height > 0 ? height : 720;
+
+    vkwlf::VkRenderer::Config vk_cfg;
+    vk_cfg.width = slot.width;
+    vk_cfg.height = slot.height;
+    auto renderer = std::make_unique<vkwlf::VkRenderer>(vk_cfg);
+    if (!renderer->Initialize(window)) {
+      LOGE(kTag, "Failed to initialize VkRenderer for WindowSlot %d", slot_idx);
+      for (auto& rf : replay_frames) {
+        if (rf.dmabuf_fd >= 0) close(rf.dmabuf_fd);
+        for (auto& p : rf.planes) {
+          if (p.fd >= 0) close(p.fd);
+        }
+      }
+      return;
+    }
+    renderer->Resize(slot.width, slot.height);
+    renderer->SetTargetSurfaceId(slot.target_surface_id);
+    for (const auto& rf : replay_frames) {
+      renderer->ProcessAndPresentFrame(rf);
+    }
+    slot.renderer = std::move(renderer);
+  }
+
+  UpdateSlotAssignmentsAndNotify();
+  {
+    std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+    auto it = g_app.slots.find(slot_idx);
+    if (it != g_app.slots.end()) {
+      WindowSlot& slot = it->second;
+      if (slot.renderer) {
+        slot.renderer->Repaint();
+      }
+      if (g_app.server && slot.target_surface_id != 0) {
+        g_app.server->SetDisplaySizeForSurface(slot.target_surface_id, slot.width, slot.height);
+      }
+    }
+  }
+}
+
+void ResizeWindowSlot(int slot_idx, uint32_t width, uint32_t height) {
+  if (slot_idx < 0 || width == 0 || height == 0) return;
+  uint32_t target_sid = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+    auto it = g_app.slots.find(slot_idx);
+    if (it == g_app.slots.end()) return;
+    WindowSlot& slot = it->second;
+    slot.width = width;
+    slot.height = height;
+    target_sid = slot.target_surface_id;
+    if (slot.renderer) {
+      slot.renderer->Resize(width, height);
+    }
+  }
+  if (g_app.server) {
+    if (target_sid != 0) {
+      g_app.server->SetDisplaySizeForSurface(target_sid, width, height);
+    } else if (slot_idx == 0) {
+      g_app.server->SetDisplaySize(width, height);
+    }
+  }
+}
+
+void DetachWindowSlot(int slot_idx) {
+  if (slot_idx < 0) return;
+  std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+  auto it = g_app.slots.find(slot_idx);
+  if (it == g_app.slots.end()) return;
+  WindowSlot& slot = it->second;
+  if (slot.renderer) {
+    slot.renderer->Shutdown();
+    slot.renderer.reset();
+  }
+#ifdef __ANDROID__
+  if (slot.window) {
+    ANativeWindow_release(slot.window);
+    slot.window = nullptr;
+  }
+#endif
+}
+
+void SelectSurfaceForWindowSlot(int slot_idx, uint32_t surface_id) {
+  if (slot_idx < 0 || surface_id == 0) return;
+  std::string title;
+  std::string app_id;
+  std::vector<uint8_t> icon_png;
+  bool found = false;
+  {
+    std::lock_guard<std::mutex> lock(g_app.cache_mutex);
+    auto it = g_app.cached_frames.find(surface_id);
+    if (it != g_app.cached_frames.end()) {
+      title = it->second.title;
+      app_id = it->second.app_id;
+      icon_png = it->second.icon_png;
+      found = true;
+    }
+  }
+  uint32_t slot_w = 1280;
+  uint32_t slot_h = 720;
+  {
+    std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+    WindowSlot& slot = g_app.slots[slot_idx];
+    slot.target_surface_id = surface_id;
+    slot.user_pinned_surface = true;
+    slot_w = slot.width;
+    slot_h = slot.height;
+    if (slot.renderer) {
+      slot.renderer->SetTargetSurfaceId(surface_id);
+      slot.renderer->Repaint();
+    }
+  }
+  if (g_app.server) {
+    g_app.server->SetActiveInputSurface(surface_id);
+    g_app.server->SetDisplaySizeForSurface(surface_id, slot_w, slot_h);
+  }
+  if (found) {
+    NotifySlotAppInfo(slot_idx, surface_id, title, app_id, icon_png, true);
+  }
+  NotifyAllActivitiesAppsList();
 }
 
 }  // namespace
@@ -299,56 +758,201 @@ extern "C" {
 
 // --- Standalone VkWlfApp (com.google.example.vkwlf.MainActivity) JNI bindings ---
 
+JNIEXPORT jint JNICALL
+Java_com_google_example_vkwlf_MainActivity_nativeAllocateWindowSlot(JNIEnv* env,
+                                                                    jclass /*clazz*/,
+                                                                    jint preferred_slot) {
+  env->GetJavaVM(&g_app.jvm);
+  int slot_id = AllocateWindowSlot(static_cast<int>(preferred_slot));
+  LOGI(kTag, "JNI nativeAllocateWindowSlot(preferred=%d) -> slot=%d", preferred_slot, slot_id);
+  return static_cast<jint>(slot_id);
+}
+
+JNIEXPORT void JNICALL
+Java_com_google_example_vkwlf_MainActivity_nativeReleaseWindowSlot(JNIEnv* /*env*/,
+                                                                   jclass /*clazz*/,
+                                                                   jint slot) {
+  LOGI(kTag, "JNI nativeReleaseWindowSlot(slot=%d)", slot);
+  ReleaseWindowSlot(static_cast<int>(slot));
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_google_example_vkwlf_MainActivity_nativeGetSurfaceIconPng(JNIEnv* env,
+                                                                   jclass /*clazz*/,
+                                                                   jint surface_id) {
+  std::vector<uint8_t> icon_png;
+  {
+    std::lock_guard<std::mutex> lock(g_app.cache_mutex);
+    auto it = g_app.cached_frames.find(static_cast<uint32_t>(surface_id));
+    if (it != g_app.cached_frames.end()) {
+      icon_png = it->second.icon_png;
+    }
+  }
+  if (icon_png.empty()) return nullptr;
+  jbyteArray arr = env->NewByteArray(static_cast<jsize>(icon_png.size()));
+  if (arr) {
+    env->SetByteArrayRegion(arr, 0, static_cast<jsize>(icon_png.size()),
+                            reinterpret_cast<const jbyte*>(icon_png.data()));
+  }
+  return arr;
+}
+
+JNIEXPORT void JNICALL
+Java_com_google_example_vkwlf_MainActivity_nativeOnSurfaceCreatedForSlot(JNIEnv* env,
+                                                                         jobject thiz,
+                                                                         jint slot,
+                                                                         jobject surface,
+                                                                         jint width,
+                                                                         jint height) {
+  env->GetJavaVM(&g_app.jvm);
+  ANativeWindow* win = ANativeWindow_fromSurface(env, surface);
+  LOGI(kTag, "JNI nativeOnSurfaceCreatedForSlot(slot=%d): ANativeWindow=%p (%dx%d)", slot,
+       static_cast<void*>(win), width, height);
+  AttachWindowSlot(static_cast<int>(slot), thiz, win,
+                   static_cast<uint32_t>(width > 0 ? width : 1280),
+                   static_cast<uint32_t>(height > 0 ? height : 720));
+}
+
+JNIEXPORT void JNICALL
+Java_com_google_example_vkwlf_MainActivity_nativeOnSurfaceChangedForSlot(JNIEnv* /*env*/,
+                                                                         jobject /*thiz*/,
+                                                                         jint slot,
+                                                                         jint width,
+                                                                         jint height) {
+  LOGI(kTag, "JNI nativeOnSurfaceChangedForSlot(slot=%d): %dx%d", slot, width, height);
+  if (width > 0 && height > 0) {
+    ResizeWindowSlot(static_cast<int>(slot), static_cast<uint32_t>(width),
+                     static_cast<uint32_t>(height));
+  }
+}
+
+JNIEXPORT void JNICALL
+Java_com_google_example_vkwlf_MainActivity_nativeOnSurfaceDestroyedForSlot(JNIEnv* /*env*/,
+                                                                           jobject /*thiz*/,
+                                                                           jint slot) {
+  LOGI(kTag, "JNI nativeOnSurfaceDestroyedForSlot(slot=%d)", slot);
+  DetachWindowSlot(static_cast<int>(slot));
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_google_example_vkwlf_MainActivity_nativeOnMotionEventForSlot(JNIEnv* /*env*/,
+                                                                      jobject /*thiz*/,
+                                                                      jint slot,
+                                                                      jint action,
+                                                                      jfloat x,
+                                                                      jfloat y,
+                                                                      jint button_state,
+                                                                      jfloat vscroll,
+                                                                      jfloat hscroll,
+                                                                      jlong event_time_ms) {
+  if (!g_app.input) return JNI_FALSE;
+  int slot_idx = static_cast<int>(slot);
+  float mapped_x = x;
+  float mapped_y = y;
+  if (slot_idx >= 0) {
+    uint32_t target_sid = 0;
+    uint32_t slot_w = 0;
+    uint32_t slot_h = 0;
+    {
+      std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+      auto sit = g_app.slots.find(slot_idx);
+      if (sit != g_app.slots.end()) {
+        target_sid = sit->second.target_surface_id;
+        slot_w = sit->second.width;
+        slot_h = sit->second.height;
+      }
+    }
+    if (target_sid != 0) {
+      if (g_app.server) {
+        g_app.server->SetActiveInputSurface(target_sid);
+      }
+      uint32_t surf_w = 0;
+      uint32_t surf_h = 0;
+      {
+        std::lock_guard<std::mutex> lock(g_app.cache_mutex);
+        auto it = g_app.cached_frames.find(target_sid);
+        if (it != g_app.cached_frames.end()) {
+          surf_w = it->second.width;
+          surf_h = it->second.height;
+        }
+      }
+      if (slot_w > 0 && slot_h > 0 && surf_w > 0 && surf_h > 0 &&
+          (surf_w != slot_w || surf_h != slot_h)) {
+        mapped_x = x * static_cast<float>(surf_w) / static_cast<float>(slot_w);
+        mapped_y = y * static_cast<float>(surf_h) / static_cast<float>(slot_h);
+      }
+    }
+  }
+  bool handled = g_app.input->OnAndroidMotionEvent(
+      action, mapped_x, mapped_y, button_state, vscroll, hscroll,
+      static_cast<uint32_t>(event_time_ms));
+  return handled ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_google_example_vkwlf_MainActivity_nativeOnKeyEventForSlot(JNIEnv* /*env*/,
+                                                                   jobject /*thiz*/,
+                                                                   jint slot,
+                                                                   jint action,
+                                                                   jint keycode,
+                                                                   jint meta_state,
+                                                                   jlong event_time_ms) {
+  if (!g_app.input) return JNI_FALSE;
+  int slot_idx = static_cast<int>(slot);
+  if (slot_idx >= 0 && g_app.server) {
+    uint32_t target_sid = 0;
+    {
+      std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+      auto sit = g_app.slots.find(slot_idx);
+      if (sit != g_app.slots.end()) {
+        target_sid = sit->second.target_surface_id;
+      }
+    }
+    if (target_sid != 0) {
+      g_app.server->SetActiveInputSurface(target_sid);
+    }
+  }
+  bool handled = g_app.input->OnAndroidKeyEvent(action, keycode, meta_state,
+                                                static_cast<uint32_t>(event_time_ms));
+  return handled ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_google_example_vkwlf_MainActivity_nativeSelectSurfaceForSlot(JNIEnv* /*env*/,
+                                                                      jobject /*thiz*/,
+                                                                      jint slot,
+                                                                      jint surface_id) {
+  LOGI(kTag, "JNI nativeSelectSurfaceForSlot(slot=%d, surface_id=%d)", slot, surface_id);
+  SelectSurfaceForWindowSlot(static_cast<int>(slot), static_cast<uint32_t>(surface_id));
+}
+
 JNIEXPORT void JNICALL
 Java_com_google_example_vkwlf_MainActivity_nativeOnSurfaceCreated(JNIEnv* env,
                                                                   jobject thiz,
                                                                   jobject surface,
                                                                   jint width,
                                                                   jint height) {
-  env->GetJavaVM(&g_app.jvm);
-  if (g_app.main_activity_global) {
-    env->DeleteGlobalRef(g_app.main_activity_global);
-    g_app.main_activity_global = nullptr;
-  }
-  if (thiz) {
-    g_app.main_activity_global = env->NewGlobalRef(thiz);
-  }
-  ANativeWindow* win = ANativeWindow_fromSurface(env, surface);
-  LOGI(kTag, "JNI nativeOnSurfaceCreated: ANativeWindow=%p (%dx%d)", static_cast<void*>(win), width,
-       height);
-  StartRenderLoop(win, static_cast<uint32_t>(width > 0 ? width : 1280),
-                  static_cast<uint32_t>(height > 0 ? height : 720));
+  Java_com_google_example_vkwlf_MainActivity_nativeOnSurfaceCreatedForSlot(env, thiz, 0, surface,
+                                                                           width, height);
 }
 
 JNIEXPORT void JNICALL
-Java_com_google_example_vkwlf_MainActivity_nativeOnSurfaceChanged(JNIEnv* /*env*/,
-                                                                  jobject /*thiz*/,
+Java_com_google_example_vkwlf_MainActivity_nativeOnSurfaceChanged(JNIEnv* env,
+                                                                  jobject thiz,
                                                                   jint width,
                                                                   jint height) {
-  LOGI(kTag, "JNI nativeOnSurfaceChanged: %dx%d", width, height);
-  if (width > 0 && height > 0) {
-    g_app.latest_width.store(static_cast<uint32_t>(width));
-    g_app.latest_height.store(static_cast<uint32_t>(height));
-  }
-  if (g_app.server) {
-    g_app.server->SetDisplaySize(static_cast<uint32_t>(width), static_cast<uint32_t>(height));
-  }
-  std::lock_guard<std::mutex> lock(g_app.renderer_mutex);
-  if (g_app.renderer) {
-    g_app.renderer->Resize(static_cast<uint32_t>(width), static_cast<uint32_t>(height));
-  }
+  Java_com_google_example_vkwlf_MainActivity_nativeOnSurfaceChangedForSlot(env, thiz, 0, width,
+                                                                           height);
 }
 
 JNIEXPORT void JNICALL
-Java_com_google_example_vkwlf_MainActivity_nativeOnSurfaceDestroyed(JNIEnv* /*env*/,
-                                                                    jobject /*thiz*/) {
-  LOGI(kTag, "JNI nativeOnSurfaceDestroyed");
-  StopRenderLoop();
+Java_com_google_example_vkwlf_MainActivity_nativeOnSurfaceDestroyed(JNIEnv* env, jobject thiz) {
+  Java_com_google_example_vkwlf_MainActivity_nativeOnSurfaceDestroyedForSlot(env, thiz, 0);
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_google_example_vkwlf_MainActivity_nativeOnMotionEvent(JNIEnv* /*env*/,
-                                                               jobject /*thiz*/,
+Java_com_google_example_vkwlf_MainActivity_nativeOnMotionEvent(JNIEnv* env,
+                                                               jobject thiz,
                                                                jint action,
                                                                jfloat x,
                                                                jfloat y,
@@ -356,23 +960,19 @@ Java_com_google_example_vkwlf_MainActivity_nativeOnMotionEvent(JNIEnv* /*env*/,
                                                                jfloat vscroll,
                                                                jfloat hscroll,
                                                                jlong event_time_ms) {
-  if (!g_app.input) return JNI_FALSE;
-  bool handled = g_app.input->OnAndroidMotionEvent(
-      action, x, y, button_state, vscroll, hscroll, static_cast<uint32_t>(event_time_ms));
-  return handled ? JNI_TRUE : JNI_FALSE;
+  return Java_com_google_example_vkwlf_MainActivity_nativeOnMotionEventForSlot(
+      env, thiz, 0, action, x, y, button_state, vscroll, hscroll, event_time_ms);
 }
 
 JNIEXPORT jboolean JNICALL
-Java_com_google_example_vkwlf_MainActivity_nativeOnKeyEvent(JNIEnv* /*env*/,
-                                                            jobject /*thiz*/,
+Java_com_google_example_vkwlf_MainActivity_nativeOnKeyEvent(JNIEnv* env,
+                                                            jobject thiz,
                                                             jint action,
                                                             jint keycode,
                                                             jint meta_state,
                                                             jlong event_time_ms) {
-  if (!g_app.input) return JNI_FALSE;
-  bool handled = g_app.input->OnAndroidKeyEvent(action, keycode, meta_state,
-                                                static_cast<uint32_t>(event_time_ms));
-  return handled ? JNI_TRUE : JNI_FALSE;
+  return Java_com_google_example_vkwlf_MainActivity_nativeOnKeyEventForSlot(
+      env, thiz, 0, action, keycode, meta_state, event_time_ms);
 }
 
 // --- Android Terminal app (com.android.virtualization.terminal.VkWlfCompositorBridge) JNI bindings ---
@@ -399,9 +999,9 @@ Java_com_android_virtualization_terminal_VkWlfCompositorBridge_nativeStartServer
   std::string sock_path = c_sock ? c_sock : "/data/local/tmp/wayland-0";
   if (c_sock) env->ReleaseStringUTFChars(j_socket_path, c_sock);
 
-  EnsureServerStarted(sock_path, vsock_port, tcp_port,
-                      static_cast<uint32_t>(width > 0 ? width : 1920),
-                      static_cast<uint32_t>(height > 0 ? height : 1080));
+  EnsureServerAndPumpStarted(sock_path, vsock_port, tcp_port,
+                             static_cast<uint32_t>(width > 0 ? width : 1920),
+                             static_cast<uint32_t>(height > 0 ? height : 1080));
 }
 
 JNIEXPORT void JNICALL
@@ -458,6 +1058,7 @@ int main(int argc, char** argv) {
   uint32_t width = 1280;
   uint32_t height = 720;
   uint64_t max_frames = 0;
+  uint32_t target_surface = 0;
   bool inject_test_input = false;
   std::string dump_ppm_path;
 
@@ -474,6 +1075,8 @@ int main(int argc, char** argv) {
       height = static_cast<uint32_t>(std::atoi(argv[++i]));
     } else if (strcmp(argv[i], "--max-frames") == 0 && i + 1 < argc) {
       max_frames = static_cast<uint64_t>(std::atoll(argv[++i]));
+    } else if (strcmp(argv[i], "--target-surface") == 0 && i + 1 < argc) {
+      target_surface = static_cast<uint32_t>(std::atoi(argv[++i]));
     } else if (strcmp(argv[i], "--inject-test-input") == 0) {
       inject_test_input = true;
     } else if (strcmp(argv[i], "--dump-ppm") == 0 && i + 1 < argc) {
@@ -513,6 +1116,9 @@ int main(int argc, char** argv) {
     LOGE(kTag, "Failed to initialize VkRenderer");
     server.Stop();
     return 1;
+  }
+  if (target_surface != 0) {
+    renderer.SetTargetSurfaceId(target_surface);
   }
 
   vkwlf::InputHandler input_handler(&server);

@@ -79,7 +79,7 @@ javac --release 11 -classpath "$ANDROID_JAR" -d "$PK/classes" \
 echo "== package"
 cp "$NBUILD/libvkwlf_jni.so" "$PK/lib/$ABI/"
 ( cd "$PK" && zip -q -u -0 unaligned.apk classes.dex "lib/$ABI/libvkwlf_jni.so" )
-"$ZIPALIGN" -f 4 "$PK/unaligned.apk" "$PK/aligned.apk"
+"$ZIPALIGN" -f -p 4 "$PK/unaligned.apk" "$PK/aligned.apk"
 KS="$OUT/debug.keystore"
 [[ -f "$KS" ]] || keytool -genkeypair -v -keystore "$KS" -storepass android -keypass android -alias androiddebugkey \
   -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1

@@ -143,6 +143,7 @@ if(ANDROID)
     src/main.cpp
   )
   target_include_directories(vkwlf_jni PRIVATE include "${GEN_DIR}")
+  target_link_options(vkwlf_jni PRIVATE "-Wl,-z,max-page-size=16384" "-Wl,-z,common-page-size=16384")
   target_link_libraries(vkwlf_jni PRIVATE
     wayland_server_static
     android
@@ -156,6 +157,7 @@ if(ANDROID)
     src/main.cpp
   )
   target_include_directories(vkwlf_compositor PRIVATE include "${GEN_DIR}")
+  target_link_options(vkwlf_compositor PRIVATE "-Wl,-z,max-page-size=16384" "-Wl,-z,common-page-size=16384")
   target_link_libraries(vkwlf_compositor PRIVATE
     wayland_server_static
     android
@@ -173,7 +175,7 @@ if(ANDROID)
   )
   set_target_properties(vkwlf_gpu_client PROPERTIES OUTPUT_NAME "libvkwlf_gpu_client.so")
   target_include_directories(vkwlf_gpu_client PRIVATE include "${GEN_DIR}")
-  target_link_options(vkwlf_gpu_client PRIVATE "-pie")
+  target_link_options(vkwlf_gpu_client PRIVATE "-pie" "-Wl,-z,max-page-size=16384" "-Wl,-z,common-page-size=16384")
   target_link_libraries(vkwlf_gpu_client PRIVATE
     wayland_server_static
     android

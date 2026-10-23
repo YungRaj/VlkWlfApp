@@ -112,6 +112,13 @@ class WaylandServerEngine {
   // Updates advertised output/toplevel dimensions on surface resize and sends
   // xdg_toplevel.configure(width, height) to active clients.
   void SetDisplaySize(uint32_t width, uint32_t height);
+  void SetDisplaySizeForSurface(uint32_t surface_id, uint32_t width, uint32_t height);
+
+  // Binds subsequent input commands to a specific toplevel surface_id and its host window size.
+  void SetActiveInputSurface(uint32_t surface_id,
+                             uint32_t host_width = 0,
+                             uint32_t host_height = 0);
+  void FocusSurfaceById(uint32_t surface_id);
 
   // Sends a serialized CommittedFrame over a stream socket (used by vkwlf_guest_proxy).
   static bool SendFrameOverBridgeSocket(int sock_fd, const CommittedFrame& frame);
@@ -142,6 +149,16 @@ class WaylandServerEngine {
                                            double* out_local_x,
                                            double* out_local_y) const;
   void SetToplevelGeometry(int32_t crop_x, int32_t crop_y, uint32_t crop_w, uint32_t crop_h);
+  void RecordSurfaceGeometry(uint32_t surface_id,
+                             int32_t crop_x,
+                             int32_t crop_y,
+                             uint32_t crop_w,
+                             uint32_t crop_h);
+  bool GetSurfaceGeometry(uint32_t surface_id,
+                          int32_t* out_crop_x,
+                          int32_t* out_crop_y,
+                          uint32_t* out_crop_w,
+                          uint32_t* out_crop_h) const;
   void OnSurfaceUnmappedOrDestroyed(struct wl_resource* surface_res,
                                     uint32_t surface_id,
                                     bool was_drawable);
@@ -160,6 +177,7 @@ class WaylandServerEngine {
       kKeyboardModifiers = 5,
       kDisplayResize = 6,
       kQuit = 7,
+      kFocusSurface = 8,
     };
     Type type;
     uint32_t time_ms = 0;
@@ -171,6 +189,9 @@ class WaylandServerEngine {
     uint32_t mods_latched = 0;
     uint32_t mods_locked = 0;
     uint32_t group = 0;
+    uint32_t target_surface_id = 0;
+    uint32_t host_width = 0;
+    uint32_t host_height = 0;
   };
 
   struct ToplevelEntry {
@@ -230,14 +251,26 @@ class WaylandServerEngine {
   std::vector<struct wl_resource*> keyboard_resources_;
   std::vector<ToplevelEntry> toplevel_entries_;
   struct wl_resource* focused_surface_ = nullptr;
+  struct wl_resource* preferred_base_surface_ = nullptr;
   bool pointer_entered_ = false;
   bool keyboard_entered_ = false;
+  std::atomic<uint32_t> active_input_surface_id_{0};
+  std::atomic<uint32_t> active_input_width_{0};
+  std::atomic<uint32_t> active_input_height_{0};
   std::atomic<uint32_t> host_display_width_{0};
   std::atomic<uint32_t> host_display_height_{0};
   std::atomic<int32_t> last_crop_x_{0};
   std::atomic<int32_t> last_crop_y_{0};
   std::atomic<uint32_t> last_crop_w_{0};
   std::atomic<uint32_t> last_crop_h_{0};
+  struct SurfaceGeomInfo {
+    int32_t crop_x = 0;
+    int32_t crop_y = 0;
+    uint32_t crop_w = 0;
+    uint32_t crop_h = 0;
+  };
+  mutable std::mutex surface_geom_mutex_;
+  std::unordered_map<uint32_t, SurfaceGeomInfo> surface_geometries_;
   double last_pointer_x_ = 0.0;
   double last_pointer_y_ = 0.0;
   uint32_t pressed_buttons_mask_ = 0;

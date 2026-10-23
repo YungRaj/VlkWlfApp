@@ -78,11 +78,19 @@ class VkRenderer {
   // Saves the most recently rendered Vulkan swapchain/offscreen frame to a binary PPM (P6) file.
   bool SaveLastFramePpm(const std::string& path);
 
+  // Restricts this VkRenderer instance to composite only a specific base xdg_toplevel surface
+  // (plus any child dialogs/popups/subsurfaces belonging to it). Pass 0 to composite all surfaces.
+  void SetTargetSurfaceId(uint32_t surface_id);
+  uint32_t TargetSurfaceId() const;
+  bool Repaint();
+
   RenderStats GetStats() const;
 
  private:
   struct SurfaceTexture {
     uint32_t surface_id = 0;
+    uint32_t parent_surface_id = 0;
+    std::string app_id;
     uint32_t width = 0;
     uint32_t height = 0;
     VkFormat format = VK_FORMAT_B8G8R8A8_UNORM;
@@ -193,6 +201,7 @@ class VkRenderer {
   VkDeviceMemory vertex_memory_ = VK_NULL_HANDLE;
 
   std::unordered_map<uint32_t, SurfaceTexture> surface_textures_;
+  uint32_t target_surface_id_ = 0;
   mutable std::mutex render_mutex_;
   mutable std::mutex stats_mutex_;
   RenderStats stats_{};

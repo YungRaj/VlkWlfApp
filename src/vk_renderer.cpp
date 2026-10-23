@@ -662,14 +662,14 @@ bool VkRenderer::CreateDescriptorResources() {
 
   VkDescriptorPoolSize pool_size{};
   pool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-  pool_size.descriptorCount = 64;
+  pool_size.descriptorCount = 256;
 
   VkDescriptorPoolCreateInfo pool_info{};
   pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
   pool_info.poolSizeCount = 1;
   pool_info.pPoolSizes = &pool_size;
-  pool_info.maxSets = 64;
+  pool_info.maxSets = 256;
 
   if (vkCreateDescriptorPool(device_, &pool_info, nullptr, &descriptor_pool_) != VK_SUCCESS) {
     LOGE(kTag, "vkCreateDescriptorPool failed");
@@ -1853,12 +1853,16 @@ bool VkRenderer::ImportAndroidHardwareBuffer(uint32_t surface_id,
   }
 
   SurfaceTexture& tex = surface_textures_[surface_id];
+  uint32_t saved_parent = tex.parent_surface_id;
+  std::string saved_app_id = tex.app_id;
   int32_t saved_x = tex.pos_x;
   int32_t saved_y = tex.pos_y;
   bool saved_popup = tex.is_popup;
   bool saved_sub = tex.is_subsurface;
   DestroySurfaceTexture(&tex);
   tex.surface_id = surface_id;
+  tex.parent_surface_id = saved_parent;
+  tex.app_id = std::move(saved_app_id);
   tex.pos_x = saved_x;
   tex.pos_y = saved_y;
   tex.is_popup = saved_popup;
@@ -2006,11 +2010,27 @@ bool VkRenderer::RecordAndSubmitRenderPass(uint32_t image_index, const SurfaceTe
 
   // Pass 1: Draw base xdg_toplevel surfaces. Full-sized toplevel windows draw fullscreen first,
   // and smaller modal/dialog toplevel windows draw centered at their native size on top.
+  std::string target_app_id;
+  if (target_surface_id_ != 0) {
+    auto tit = surface_textures_.find(target_surface_id_);
+    if (tit != surface_textures_.end()) {
+      target_app_id = tit->second.app_id;
+    }
+  }
+
   bool drew_base = false;
   std::vector<uint32_t> base_sids;
   for (const auto& [sid, surf_tex] : surface_textures_) {
     if (surf_tex.descriptor_set == VK_NULL_HANDLE) continue;
     if (surf_tex.is_popup || surf_tex.is_subsurface) continue;
+    if (target_surface_id_ != 0 && sid != target_surface_id_) {
+      const bool is_child_dialog =
+          (surf_tex.parent_surface_id == target_surface_id_) ||
+          (!target_app_id.empty() && surf_tex.app_id == target_app_id &&
+           (surf_tex.width < (swapchain_extent_.width * 3) / 4 ||
+            surf_tex.height < (swapchain_extent_.height * 3) / 4));
+      if (!is_child_dialog) continue;
+    }
     base_sids.push_back(sid);
   }
   std::sort(base_sids.begin(), base_sids.end(), [this](uint32_t a, uint32_t b) {
@@ -2025,8 +2045,7 @@ bool VkRenderer::RecordAndSubmitRenderPass(uint32_t image_index, const SurfaceTe
     const auto& surf_tex = surface_textures_[sid];
     const bool is_dialog_size =
         (base_sids.size() > 1) && (surf_tex.width > 0 && surf_tex.height > 0) &&
-        (surf_tex.width < (swapchain_extent_.width * 3) / 4 ||
-         surf_tex.height < (swapchain_extent_.height * 3) / 4);
+        (surf_tex.parent_surface_id != 0 || surf_tex.width < 640 || surf_tex.height < 400);
     if (is_dialog_size) {
       int32_t dx = (static_cast<int32_t>(swapchain_extent_.width) -
                     static_cast<int32_t>(surf_tex.width)) /
@@ -2058,7 +2077,8 @@ bool VkRenderer::RecordAndSubmitRenderPass(uint32_t image_index, const SurfaceTe
     vkCmdDraw(render_cmd_buffer_, 6, 1, 0, 0);
     drew_base = true;
   }
-  if (!drew_base && active_tex.descriptor_set != VK_NULL_HANDLE) {
+  if (!drew_base && active_tex.descriptor_set != VK_NULL_HANDLE &&
+      (target_surface_id_ == 0 || active_tex.surface_id == target_surface_id_)) {
     vkCmdSetViewport(render_cmd_buffer_, 0, 1, &viewport);
     vkCmdSetScissor(render_cmd_buffer_, 0, 1, &scissor);
     vkCmdBindDescriptorSets(render_cmd_buffer_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_,
@@ -2071,6 +2091,10 @@ bool VkRenderer::RecordAndSubmitRenderPass(uint32_t image_index, const SurfaceTe
   for (const auto& [sid, surf_tex] : surface_textures_) {
     if (surf_tex.descriptor_set == VK_NULL_HANDLE) continue;
     if (!surf_tex.is_popup && !surf_tex.is_subsurface) continue;
+    if (target_surface_id_ != 0 && surf_tex.parent_surface_id != 0 &&
+        surf_tex.parent_surface_id != target_surface_id_) {
+      continue;
+    }
 
     VkViewport overlay_vp{};
     overlay_vp.x = static_cast<float>(surf_tex.pos_x);
@@ -2274,6 +2298,10 @@ bool VkRenderer::ProcessAndPresentFrame(const CommittedFrame& frame) {
 
   SurfaceTexture& tex = surface_textures_[frame.surface_id];
   tex.surface_id = frame.surface_id;
+  tex.parent_surface_id = frame.parent_surface_id;
+  if (!frame.app_id.empty()) {
+    tex.app_id = frame.app_id;
+  }
   tex.pos_x = frame.x;
   tex.pos_y = frame.y;
   tex.is_popup = frame.is_popup;
@@ -2379,6 +2407,31 @@ bool VkRenderer::Resize(uint32_t width, uint32_t height) {
   LOGI(kTag, "Resized VkRenderer presentation target to %ux%u", swapchain_extent_.width,
        swapchain_extent_.height);
   return true;
+}
+
+void VkRenderer::SetTargetSurfaceId(uint32_t surface_id) {
+  std::lock_guard<std::mutex> render_lock(render_mutex_);
+  target_surface_id_ = surface_id;
+}
+
+uint32_t VkRenderer::TargetSurfaceId() const {
+  std::lock_guard<std::mutex> render_lock(render_mutex_);
+  return target_surface_id_;
+}
+
+bool VkRenderer::Repaint() {
+  std::lock_guard<std::mutex> render_lock(render_mutex_);
+  if (!initialized_ || !device_ || surface_textures_.empty()) return false;
+  uint32_t image_index = 0;
+  if (use_swapchain_) {
+    VkResult acq = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX, image_available_sem_,
+                                         VK_NULL_HANDLE, &image_index);
+    if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) {
+      return false;
+    }
+  }
+  SurfaceTexture dummy{};
+  return RecordAndSubmitRenderPass(image_index, dummy);
 }
 
 VkRenderer::RenderStats VkRenderer::GetStats() const {
