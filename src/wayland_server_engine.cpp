@@ -609,6 +609,26 @@ xkb_types "complete" {
         level_name[Level1]= "Base";
         level_name[Level2]= "Caps";
     };
+    type "KEYPAD" {
+        modifiers= Shift+NumLock;
+        map[none]= Level1;
+        map[Shift]= Level2;
+        map[NumLock]= Level2;
+        map[Shift+NumLock]= Level1;
+        level_name[Level1]= "Base";
+        level_name[Level2]= "Number";
+    };
+    type "FOUR_LEVEL" {
+        modifiers= Shift+Alt;
+        map[none]= Level1;
+        map[Shift]= Level2;
+        map[Alt]= Level3;
+        map[Shift+Alt]= Level4;
+        level_name[Level1]= "Base";
+        level_name[Level2]= "Shift";
+        level_name[Level3]= "Alt Base";
+        level_name[Level4]= "Shift Alt";
+    };
 };
 xkb_compatibility "complete" {
     virtual_modifiers NumLock,Alt,Super,ScrollLock;
@@ -3402,7 +3422,22 @@ void WaylandServerEngine::UnregisterClientPointer(struct wl_resource* pointer_re
 }
 
 int WaylandServerEngine::CreateKeymapFd(size_t* out_size) {
-  const size_t len = sizeof(kMinimalXkbKeymap);  // includes null terminator
+  std::string keymap_bytes;
+  for (const char* path : {"/usr/local/share/vkwlf/default.xkb",
+                           "/home/droid/VlkWlfApp/guest/default.xkb"}) {
+    std::ifstream in(path, std::ios::binary);
+    if (in.is_open()) {
+      std::ostringstream ss;
+      ss << in.rdbuf();
+      keymap_bytes = ss.str();
+      if (!keymap_bytes.empty()) {
+        keymap_bytes.push_back('\0');
+        break;
+      }
+    }
+  }
+  const char* src_data = keymap_bytes.empty() ? kMinimalXkbKeymap : keymap_bytes.data();
+  const size_t len = keymap_bytes.empty() ? sizeof(kMinimalXkbKeymap) : keymap_bytes.size();
   int fd = memfd_create("vkwlf-xkb-keymap", MFD_CLOEXEC);
   if (fd < 0) return -1;
   if (ftruncate(fd, static_cast<off_t>(len)) < 0) {
@@ -3414,7 +3449,7 @@ int WaylandServerEngine::CreateKeymapFd(size_t* out_size) {
     close(fd);
     return -1;
   }
-  std::memcpy(ptr, kMinimalXkbKeymap, len);
+  std::memcpy(ptr, src_data, len);
   munmap(ptr, len);
   *out_size = len;
   return fd;

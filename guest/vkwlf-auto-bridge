@@ -34,8 +34,6 @@ dpy = x11.XOpenDisplay(b":15")
 if not dpy:
     raise SystemExit(0)
 root = x11.XDefaultRootWindow(ctypes.c_void_p(dpy))
-sw = x11.XDisplayWidth(ctypes.c_void_p(dpy), 0)
-sh = x11.XDisplayHeight(ctypes.c_void_p(dpy), 0)
 
 class XWindowAttributes(ctypes.Structure):
     _fields_ = [
@@ -54,10 +52,18 @@ class XWindowAttributes(ctypes.Structure):
     ]
 
 while True:
+    rattr = XWindowAttributes()
+    sw = x11.XDisplayWidth(ctypes.c_void_p(dpy), 0)
+    sh = x11.XDisplayHeight(ctypes.c_void_p(dpy), 0)
+    if x11.XGetWindowAttributes(ctypes.c_void_p(dpy), ctypes.c_ulong(root), ctypes.byref(rattr)) != 0:
+        if rattr.width > 0 and rattr.height > 0:
+            sw = rattr.width
+            sh = rattr.height
     root_ret = ctypes.c_ulong()
     parent_ret = ctypes.c_ulong()
     children_ptr = ctypes.POINTER(ctypes.c_ulong)()
     nchildren = ctypes.c_uint()
+    top_mapped_win = 0
     if x11.XQueryTree(ctypes.c_void_p(dpy), ctypes.c_ulong(root),
                       ctypes.byref(root_ret), ctypes.byref(parent_ret),
                       ctypes.byref(children_ptr), ctypes.byref(nchildren)) != 0:
@@ -65,14 +71,24 @@ while True:
             w = children_ptr[i]
             attr = XWindowAttributes()
             if x11.XGetWindowAttributes(ctypes.c_void_p(dpy), ctypes.c_ulong(w), ctypes.byref(attr)) != 0:
-                if attr.map_state == 2 and attr.width >= 400 and attr.height >= 300:
-                    if attr.x != 0 or attr.y != 0 or attr.width != sw or attr.height != sh:
-                        x11.XMoveResizeWindow(ctypes.c_void_p(dpy), ctypes.c_ulong(w), 0, 0, sw, sh)
-                        x11.XRaiseWindow(ctypes.c_void_p(dpy), ctypes.c_ulong(w))
-                        x11.XFlush(ctypes.c_void_p(dpy))
+                if attr.map_state == 2 and attr.width >= 200 and attr.height >= 100:
+                    if attr.override_redirect == 0:
+                        top_mapped_win = w
+                    if attr.width >= 400 and attr.height >= 300:
+                        if attr.x != 0 or attr.y != 0 or attr.width != sw or attr.height != sh:
+                            x11.XMoveResizeWindow(ctypes.c_void_p(dpy), ctypes.c_ulong(w), 0, 0, sw, sh)
+                            x11.XRaiseWindow(ctypes.c_void_p(dpy), ctypes.c_ulong(w))
+                            x11.XFlush(ctypes.c_void_p(dpy))
         if children_ptr:
             x11.XFree(children_ptr)
-    time.sleep(0.5)
+    if top_mapped_win != 0:
+        focus_win = ctypes.c_ulong()
+        revert_to = ctypes.c_int()
+        x11.XGetInputFocus(ctypes.c_void_p(dpy), ctypes.byref(focus_win), ctypes.byref(revert_to))
+        if focus_win.value != top_mapped_win:
+            x11.XSetInputFocus(ctypes.c_void_p(dpy), ctypes.c_ulong(top_mapped_win), 2, 0)
+            x11.XFlush(ctypes.c_void_p(dpy))
+    time.sleep(0.15)
 ' >/dev/null 2>&1 &
   WM_PID=$!
 }
