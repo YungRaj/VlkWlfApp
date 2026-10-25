@@ -2,6 +2,7 @@ package com.google.example.vkwlf;
 
 import android.app.Activity;
 import android.app.ActivityManager;
+import android.app.ActivityOptions;
 import android.content.Intent;
 import android.content.om.FabricatedOverlay;
 import android.content.om.OverlayManager;
@@ -10,11 +11,11 @@ import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Insets;
+import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
-import android.os.ParcelFileDescriptor;
 import android.system.Os;
 import android.text.TextUtils;
 import android.util.Log;
@@ -37,9 +38,9 @@ import android.widget.TextView;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -52,11 +53,25 @@ import java.util.concurrent.ConcurrentHashMap;
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final String TAG = "VkWlfApp";
     private static Process sDirectClientProcess;
-    private static final Set<Integer> sAutoLaunchedSurfaceIds =
-            Collections.synchronizedSet(new HashSet<>());
     private static final Set<Integer> sActiveWindowSurfaceIds =
             Collections.synchronizedSet(new HashSet<>());
-    private static final Map<Integer, Bitmap> sSurfaceIconCache = new ConcurrentHashMap<>();
+    private static final Map<String, Bitmap> sSurfaceIconCache = new ConcurrentHashMap<>();
+    private static final Map<Integer, Bitmap> sFallbackIconCache = new ConcurrentHashMap<>();
+    private static final Map<Integer, String> sSurfaceAppLabels = new ConcurrentHashMap<>();
+    private static final Map<Integer, MainActivity> sActiveSlotActivities =
+            new ConcurrentHashMap<>();
+    private static volatile MainActivity sPendingFinishActivity = null;
+    private static volatile MainActivity sDesiredForegroundActivity = null;
+    private static volatile long sSuppressFocusPromoteUntilMs = 0L;
+    private static volatile long sLastTransitionStartMs = 0L;
+    private static volatile int sCurrentDockLeaderTaskId = -1;
+    private static final android.os.Handler sDockOrderHandler =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+    private static volatile boolean sOneTimeHostSetupDone = false;
+    private static volatile int sLastCaptionTopPx = -1;
+    private static volatile int[] sLastKnownSurfaceIds = null;
+    private static volatile String[] sLastKnownTitles = null;
+    private static volatile String[] sLastKnownAppIds = null;
 
     static {
         System.loadLibrary("vkwlf_jni");
@@ -64,6 +79,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private int mWindowSlot = 0;
     private int mBoundSurfaceId = 0;
+    private boolean mIsBackgroundRecycle = false;
     private SurfaceView mSurfaceView;
     private FrameLayout mRoot;
     private LinearLayout mHeader;
@@ -73,8 +89,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private LinearLayout mAppSwitcherBar;
     private int mCaptionHeightPx;
     private Bitmap mCurrentIconBitmap;
-    private byte[] mLastOverlayIconBytes;
-    private String mLastOverlayLabel;
     private String mLastAppId;
     private String mLastSwitcherSignature = "";
 
@@ -91,20 +105,40 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return mWindowSlot;
     }
 
-    protected String getOverlayName() {
-        return mWindowSlot == 0
-                ? "WaylandDynamicAppMetaOverlay"
-                : "WaylandDynamicAppMetaOverlaySlot" + mWindowSlot;
-    }
-
-    protected String getOverlayLabelResource() {
-        return getPackageName()
-                + (mWindowSlot == 0 ? ":string/wayland_app_name" : ":string/app_name_teamviewer");
-    }
-
-    protected String getOverlayIconResource() {
-        return getPackageName()
-                + (mWindowSlot == 0 ? ":drawable/ic_wayland_app" : ":drawable/ic_app_teamviewer");
+    /**
+     * Unregisters any stale self-targeting FabricatedOverlays from earlier runs so that
+     * R.drawable.ic_app_teamviewer and R.string.app_name_teamviewer are never overwritten.
+     */
+    private void cleanupStaleDynamicOverlays() {
+        try {
+            OverlayManager om = getSystemService(OverlayManager.class);
+            if (om != null) {
+                String pkg = getPackageName();
+                String[] staleNames = {
+                    "WaylandDynamicAppMetaOverlay",
+                    "WaylandDynamicAppMetaOverlaySlot0",
+                    "WaylandDynamicAppMetaOverlaySlot1",
+                    "WaylandDynamicAppMetaOverlaySlot2",
+                    "WaylandDynamicAppMetaOverlaySlot3"
+                };
+                for (String name : staleNames) {
+                    try {
+                        OverlayManagerTransaction tx = OverlayManagerTransaction.newInstance();
+                        tx.unregisterFabricatedOverlay(
+                                new FabricatedOverlay(name, pkg).getIdentifier());
+                        om.commit(tx);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+            for (int i = 0; i < 4; i++) {
+                File f = new File(getCacheDir(), "wayland_app_icon_slot" + i + ".png");
+                if (f.exists()) {
+                    f.delete();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     /**
@@ -119,7 +153,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             if (lowerId.contains("antigravity")) return "Antigravity";
         }
         if (title != null && !title.isEmpty()) {
-            if (title.toLowerCase().contains("teamviewer")) return "TeamViewer";
+            String lowerTitle = title.toLowerCase();
+            if (lowerTitle.contains("teamviewer")) return "TeamViewer";
+            if (lowerTitle.contains("antigravity")) return "Antigravity";
             String t = title;
             for (String sep : new String[] {" - ", " — ", " – "}) {
                 int i = t.indexOf(sep);
@@ -134,7 +170,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             String last = appId.substring(appId.lastIndexOf('.') + 1).replace('-', ' ').replace('_', ' ');
             return last.isEmpty() ? appId : Character.toUpperCase(last.charAt(0)) + last.substring(1);
         }
-        return "Linux Wayland App";
+        return "Antigravity";
     }
 
     private int resolveFallbackIconRes(String title, String appId) {
@@ -145,36 +181,275 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (combined.contains("antigravity")) {
             return R.drawable.ic_app_antigravity;
         }
-        return R.drawable.ic_wayland_app;
+        return getPreferredWindowSlot() == 1
+                ? R.drawable.ic_app_teamviewer
+                : R.drawable.ic_app_antigravity;
     }
 
     private Bitmap getSurfaceIconBitmap(int surfaceId, String title, String appId) {
-        Bitmap cached = sSurfaceIconCache.get(surfaceId);
-        if (cached != null) {
-            return cached;
-        }
-        try {
-            byte[] png = nativeGetSurfaceIconPng(surfaceId);
-            if (png != null && png.length > 0) {
-                Bitmap decoded = BitmapFactory.decodeByteArray(png, 0, png.length);
-                if (decoded != null) {
-                    sSurfaceIconCache.put(surfaceId, decoded);
-                    return decoded;
-                }
+        String label = deriveAppLabel(title, appId);
+        if (surfaceId > 0) {
+            String cacheKey = surfaceId + "|" + label;
+            Bitmap cached = sSurfaceIconCache.get(cacheKey);
+            if (cached != null) {
+                return cached;
             }
-        } catch (Throwable ignored) {
+            try {
+                byte[] png = nativeGetSurfaceIconPng(surfaceId);
+                if (png != null && png.length > 0) {
+                    Bitmap decoded = BitmapFactory.decodeByteArray(png, 0, png.length);
+                    if (decoded != null) {
+                        sSurfaceIconCache.put(cacheKey, decoded);
+                        return decoded;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
         }
-        return BitmapFactory.decodeResource(getResources(), resolveFallbackIconRes(title, appId));
+        int resId = resolveFallbackIconRes(title, appId);
+        Bitmap fallback = sFallbackIconCache.get(resId);
+        if (fallback == null) {
+            fallback = BitmapFactory.decodeResource(getResources(), resId);
+            if (fallback != null) {
+                sFallbackIconCache.put(resId, fallback);
+            }
+        }
+        return fallback;
     }
 
+    private static Class<? extends MainActivity> getActivityClassForLabel(String shortLabel) {
+        if ("TeamViewer".equalsIgnoreCase(shortLabel)) {
+            return SecondaryWaylandActivity.class;
+        }
+        return MainActivity.class;
+    }
+
+    private static boolean isActivityClassOpen(Class<? extends MainActivity> cls) {
+        for (MainActivity act : sActiveSlotActivities.values()) {
+            if (act != null
+                    && act != sPendingFinishActivity
+                    && !act.isFinishing()
+                    && !act.isDestroyed()
+                    && act.getClass() == cls) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static MainActivity findOpenActivityByClass(Class<? extends MainActivity> cls) {
+        for (MainActivity act : sActiveSlotActivities.values()) {
+            if (act != null
+                    && act != sPendingFinishActivity
+                    && !act.isFinishing()
+                    && !act.isDestroyed()
+                    && act.getClass() == cls) {
+                return act;
+            }
+        }
+        return null;
+    }
+
+    protected void setTaskExcludeFromRecents(boolean exclude) {
+        try {
+            ActivityManager am = getSystemService(ActivityManager.class);
+            if (am != null) {
+                final int myTaskId = getTaskId();
+                for (ActivityManager.AppTask task : am.getAppTasks()) {
+                    ActivityManager.RecentTaskInfo info = task.getTaskInfo();
+                    if (info != null && (info.taskId == myTaskId || info.id == myTaskId)) {
+                        task.setExcludeFromRecents(exclude);
+                        Log.i(TAG, "setExcludeFromRecents(" + exclude + ") for taskId=" + myTaskId
+                                + " (" + getClass().getSimpleName() + ")");
+                        break;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Failed setExcludeFromRecents(" + exclude + ")", t);
+        }
+    }
+
+    private void clearAllAppTasksExcludeFromRecents() {
+        try {
+            ActivityManager am = getSystemService(ActivityManager.class);
+            if (am != null) {
+                for (ActivityManager.AppTask task : am.getAppTasks()) {
+                    task.setExcludeFromRecents(false);
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Failed clearAllAppTasksExcludeFromRecents", t);
+        }
+    }
+
+    private void cancelPendingDockOrderAndClearExclusions() {
+        sDockOrderHandler.removeCallbacksAndMessages(null);
+        clearAllAppTasksExcludeFromRecents();
+    }
+
+    private void triggerRecentTasksRefresh() {
+        try {
+            // Calling setPictureInPictureParams invokes ActivityRecord.setPictureInPictureParams()
+            // -> getTask().onPictureInPictureParamsChanged() -> Task.dispatchTaskInfoChangedIfNeeded(true)
+            // on the Freeform leaf task (organized by ShellTaskOrganizer) ->
+            // RecentTasksController.onTaskInfoChanged() -> RecentTasksController.notifyRecentTasksChanged()
+            // synchronously with zero visual side effects and zero WindowManager transitions.
+            setPictureInPictureParams(new android.app.PictureInPictureParams.Builder().build());
+        } catch (Throwable t) {
+            Log.w(TAG, "Failed triggerRecentTasksRefresh", t);
+        }
+    }
+
+    private static void bringActivityToFront(MainActivity fg) {
+        if (fg == null || fg.isFinishing() || fg.isDestroyed()) return;
+        try {
+            sLastTransitionStartMs = System.currentTimeMillis();
+            ActivityManager am = fg.getSystemService(ActivityManager.class);
+            if (am != null) {
+                am.moveTaskToFront(fg.getTaskId(), ActivityManager.MOVE_TASK_NO_USER_ACTION);
+            }
+            fg.overridePendingTransition(0, 0);
+        } catch (Throwable t) {
+            Log.w(TAG, "Failed moveTaskToFront for taskId=" + fg.getTaskId(), t);
+        }
+    }
+
+    /**
+     * Reorders NexusLauncher's TaskbarRecentAppsController.orderedRunningTaskIds in-place so this
+     * foreground window is at index 0 (updating the GoogleBook OS dock icon to match this window)
+     * WITHOUT destroying, recreating, or moving any window.
+     *
+     * How it works:
+     * 1. During any WindowManager transition, all tasks have FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+     *    cleared so SystemUI's TrampolineLaunchTransitionObserver never closes any background task.
+     * 2. Once transitions are idle, Step 1 briefly sets setExcludeFromRecents(true) on background
+     *    tasks and calls setShouldDockBigOverlays(false) to trigger RecentTasksController
+     *    .notifyRecentTasksChanged(), removing background taskIds from orderedRunningTaskIds and
+     *    leaving [myTaskId] at index 0.
+     * 3. 70ms later, Step 2 restores setExcludeFromRecents(false) on all tasks and triggers
+     *    notifyRecentTasksChanged() again, re-appending background taskIds after myTaskId so
+     *    orderedRunningTaskIds = [myTaskId, bgTaskId...] and all tasks remain in Recents.
+     */
+    private void promoteToDockLeader() {
+        if (isFinishing() || isDestroyed() || this == sPendingFinishActivity) return;
+        final int myTaskId = getTaskId();
+        boolean hasOtherOpenWindow = false;
+        for (MainActivity act : sActiveSlotActivities.values()) {
+            if (act != null
+                    && act != this
+                    && act != sPendingFinishActivity
+                    && !act.isFinishing()
+                    && !act.isDestroyed()) {
+                hasOtherOpenWindow = true;
+                break;
+            }
+        }
+        if (!hasOtherOpenWindow) {
+            sCurrentDockLeaderTaskId = myTaskId;
+            return;
+        }
+        if (sCurrentDockLeaderTaskId == myTaskId) {
+            return;
+        }
+        cancelPendingDockOrderAndClearExclusions();
+        long elapsedSinceTransition = System.currentTimeMillis() - sLastTransitionStartMs;
+        long delayMs = (elapsedSinceTransition < 350L) ? 360L : 100L;
+        final MainActivity fg = this;
+        sDockOrderHandler.postDelayed(() -> {
+            if (fg.isFinishing() || fg.isDestroyed() || sDesiredForegroundActivity != fg) {
+                fg.clearAllAppTasksExcludeFromRecents();
+                return;
+            }
+            try {
+                ActivityManager am = fg.getSystemService(ActivityManager.class);
+                if (am != null) {
+                    for (ActivityManager.AppTask task : am.getAppTasks()) {
+                        ActivityManager.RecentTaskInfo info = task.getTaskInfo();
+                        if (info != null) {
+                            int tid = (info.taskId != -1) ? info.taskId : info.id;
+                            task.setExcludeFromRecents(tid != myTaskId);
+                        }
+                    }
+                }
+                fg.triggerRecentTasksRefresh();
+                Log.i(TAG, "DockOrder Step 1: promoted taskId=" + myTaskId
+                        + " (" + fg.getClass().getSimpleName() + ") to orderedRunningTaskIds[0]");
+            } catch (Throwable t) {
+                Log.w(TAG, "DockOrder Step 1 failed", t);
+            }
+            sDockOrderHandler.postDelayed(() -> {
+                fg.clearAllAppTasksExcludeFromRecents();
+                fg.triggerRecentTasksRefresh();
+                sCurrentDockLeaderTaskId = myTaskId;
+                Log.i(TAG, "DockOrder Step 2: restored background tasks in recents behind taskId="
+                        + myTaskId);
+            }, 150L);
+        }, delayMs);
+    }
+
+    private void markAsForegroundTaskForDock() {
+        if (isFinishing() || isDestroyed() || this == sPendingFinishActivity) return;
+        sDesiredForegroundActivity = this;
+        promoteToDockLeader();
+    }
+
+    private static int resolveIntentTargetSurface(Intent intent) {
+        if (intent == null) return 0;
+        int targetSid = intent.getIntExtra("target_surface_id", 0);
+        if (targetSid <= 0 && intent.getData() != null) {
+            try {
+                String lastSeg = intent.getData().getLastPathSegment();
+                if (lastSeg != null) {
+                    targetSid = Integer.parseInt(lastSeg);
+                }
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return targetSid;
+    }
+
+    @SuppressWarnings("deprecation")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
         super.onCreate(savedInstanceState);
+        Intent launchIntent = getIntent();
+        mIsBackgroundRecycle =
+                launchIntent != null
+                        && launchIntent.getBooleanExtra("is_background_recycle", false);
         mWindowSlot = nativeAllocateWindowSlot(getPreferredWindowSlot());
-        setupHostXdgEnvironment();
+        sActiveSlotActivities.put(mWindowSlot, this);
+        if (!sOneTimeHostSetupDone) {
+            sOneTimeHostSetupDone = true;
+            setupHostXdgEnvironment();
+            Thread cleanupThread = new Thread(this::cleanupStaleDynamicOverlays, "VkWlfOverlayCleanup");
+            cleanupThread.setDaemon(true);
+            cleanupThread.start();
+        }
 
         final int slot = mWindowSlot;
+        final int initialTargetSid = resolveIntentTargetSurface(getIntent());
+        final String defaultLabel =
+                getString(slot == 1 ? R.string.app_name_teamviewer : R.string.app_name_antigravity);
+        final String initialLabel =
+                (initialTargetSid > 0 && sSurfaceAppLabels.containsKey(initialTargetSid))
+                        ? sSurfaceAppLabels.get(initialTargetSid)
+                        : defaultLabel;
+        final Bitmap initialIcon = getSurfaceIconBitmap(initialTargetSid, initialLabel, initialLabel);
+        setTitle(initialLabel);
+        if (initialIcon != null) {
+            mCurrentIconBitmap = initialIcon;
+            setTaskDescription(new ActivityManager.TaskDescription(initialLabel, initialIcon));
+        } else {
+            setTaskDescription(new ActivityManager.TaskDescription(initialLabel));
+        }
+
+        final float dp = getResources().getDisplayMetrics().density;
+        final int barHeightPx = (int) (38 * dp);
+        final int topOffsetPx = (sLastCaptionTopPx >= 0) ? sLastCaptionTopPx : (int) (40 * dp);
+        mCaptionHeightPx = topOffsetPx + barHeightPx;
+
         mSurfaceView = new SurfaceView(this);
         mSurfaceView.setFocusable(true);
         mSurfaceView.setFocusableInTouchMode(true);
@@ -201,37 +476,31 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     hscroll,
                     event.getEventTime());
         });
-        mSurfaceView.addOnLayoutChangeListener(
-                (v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
-                    int w = right - left;
-                    int h = bottom - top;
-                    int oldW = oldRight - oldLeft;
-                    int oldH = oldBottom - oldTop;
-                    if (w > 0 && h > 0 && (w != oldW || h != oldH)) {
-                        nativeOnSurfaceChangedForSlot(slot, w, h);
-                    }
-                });
 
         mRoot = new FrameLayout(this);
-        mRoot.addView(mSurfaceView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        FrameLayout.LayoutParams surfaceLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+        surfaceLp.topMargin = mCaptionHeightPx;
+        mRoot.addView(mSurfaceView, surfaceLp);
 
         mHeader = new LinearLayout(this);
         mHeader.setOrientation(LinearLayout.HORIZONTAL);
         mHeader.setGravity(Gravity.CENTER_VERTICAL);
-        final float dp = getResources().getDisplayMetrics().density;
-        mHeader.setPadding((int) (72 * dp), 0, (int) (160 * dp), 0);
+        mHeader.setPadding((int) (14 * dp), 0, (int) (14 * dp), 0);
         mHeaderIcon = new ImageView(this);
-        mHeaderIcon.setImageResource(
-                slot == 1 ? R.drawable.ic_app_teamviewer : R.drawable.ic_app_antigravity);
+        if (mCurrentIconBitmap != null) {
+            mHeaderIcon.setImageBitmap(mCurrentIconBitmap);
+        } else {
+            mHeaderIcon.setImageResource(
+                    slot == 1 ? R.drawable.ic_app_teamviewer : R.drawable.ic_app_antigravity);
+        }
         LinearLayout.LayoutParams iconLp =
                 new LinearLayout.LayoutParams((int) (20 * dp), (int) (20 * dp));
         iconLp.setMarginEnd((int) (10 * dp));
         mHeader.addView(mHeaderIcon, iconLp);
 
         mHeaderTitle = new TextView(this);
-        mHeaderTitle.setText(
-                getString(slot == 1 ? R.string.app_name_teamviewer : R.string.app_name_antigravity));
+        mHeaderTitle.setText(initialLabel);
         mHeaderTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         mHeaderTitle.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         mHeaderTitle.setSingleLine(true);
@@ -251,10 +520,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mHeader.addView(mAppSwitcherScroll, new LinearLayout.LayoutParams(
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
 
-        mHeader.setVisibility(View.GONE);
+        mHeader.setVisibility(View.VISIBLE);
         mHeader.setOnTouchListener((v, e) -> false);
-        mRoot.addView(mHeader, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, Gravity.TOP));
+        FrameLayout.LayoutParams headerLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, barHeightPx, Gravity.TOP);
+        headerLp.topMargin = topOffsetPx;
+        mRoot.addView(mHeader, headerLp);
         applyHeaderTheme();
 
         setContentView(mRoot);
@@ -273,36 +544,87 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         });
         mSurfaceView.requestFocus();
         handleIntentTargetSurface(getIntent());
+        int[] cachedSids = sLastKnownSurfaceIds;
+        String[] cachedTitles = sLastKnownTitles;
+        String[] cachedAppIds = sLastKnownAppIds;
+        if (cachedSids != null && cachedTitles != null && cachedAppIds != null) {
+            populateAppSwitcherBarUi(
+                    cachedSids,
+                    cachedTitles,
+                    cachedAppIds,
+                    mBoundSurfaceId > 0 ? mBoundSurfaceId : initialTargetSid);
+        }
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
+        mIsBackgroundRecycle =
+                intent != null && intent.getBooleanExtra("is_background_recycle", false);
         setIntent(intent);
         handleIntentTargetSurface(intent);
+        markAsForegroundTaskForDock();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (this != sPendingFinishActivity) {
+            markAsForegroundTaskForDock();
+        }
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && this != sPendingFinishActivity && !isFinishing()) {
+            markAsForegroundTaskForDock();
+        }
+    }
+
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        if (ev != null && ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
+            mIsBackgroundRecycle = false;
+            sSuppressFocusPromoteUntilMs = 0L;
+            sDesiredForegroundActivity = this;
+            markAsForegroundTaskForDock();
+        }
+        return super.dispatchTouchEvent(ev);
     }
 
     @Override
     protected void onDestroy() {
-        if (mBoundSurfaceId > 0) {
-            sActiveWindowSurfaceIds.remove(mBoundSurfaceId);
+        if (sPendingFinishActivity == this) {
+            sPendingFinishActivity = null;
         }
+        sActiveSlotActivities.remove(mWindowSlot, this);
+        if (mBoundSurfaceId > 0) {
+            boolean stillBoundElsewhere = false;
+            for (MainActivity act : sActiveSlotActivities.values()) {
+                if (act != null
+                        && act != this
+                        && !act.isFinishing()
+                        && !act.isDestroyed()
+                        && act.mBoundSurfaceId == mBoundSurfaceId) {
+                    stillBoundElsewhere = true;
+                    break;
+                }
+            }
+            if (!stillBoundElsewhere) {
+                sActiveWindowSurfaceIds.remove(mBoundSurfaceId);
+            }
+        }
+        if (sCurrentDockLeaderTaskId == getTaskId()) {
+            sCurrentDockLeaderTaskId = -1;
+        }
+        clearAllAppTasksExcludeFromRecents();
         nativeReleaseWindowSlot(mWindowSlot);
         super.onDestroy();
     }
 
     private void handleIntentTargetSurface(Intent intent) {
-        if (intent == null) return;
-        int targetSid = intent.getIntExtra("target_surface_id", 0);
-        if (targetSid <= 0 && intent.getData() != null) {
-            try {
-                String lastSeg = intent.getData().getLastPathSegment();
-                if (lastSeg != null) {
-                    targetSid = Integer.parseInt(lastSeg);
-                }
-            } catch (NumberFormatException ignored) {
-            }
-        }
+        int targetSid = resolveIntentTargetSurface(intent);
         if (targetSid > 0) {
             mBoundSurfaceId = targetSid;
             sActiveWindowSurfaceIds.add(targetSid);
@@ -341,7 +663,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void onCaptionInsets(int captionHeightPx, WindowInsets insets, int width) {
         final float dp = getResources().getDisplayMetrics().density;
         int barHeightPx = (int) (38 * dp);
-        int topOffsetPx = Math.max(0, captionHeightPx);
+        int topOffsetPx;
+        if (captionHeightPx > 0) {
+            topOffsetPx = captionHeightPx;
+            sLastCaptionTopPx = topOffsetPx;
+        } else {
+            topOffsetPx = (sLastCaptionTopPx > 0) ? sLastCaptionTopPx : (int) (40 * dp);
+        }
         int totalTopPx = topOffsetPx + barHeightPx;
         mHeader.setPadding((int) (14 * dp), 0, (int) (14 * dp), 0);
         if (totalTopPx == mCaptionHeightPx) return;
@@ -452,130 +780,193 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     public void onWaylandAppsChanged(
             int[] surfaceIds, String[] titles, String[] appIds, int boundSurfaceId) {
         if (surfaceIds == null || titles == null || appIds == null) return;
-        runOnUiThread(() -> {
-            if (mBoundSurfaceId > 0 && mBoundSurfaceId != boundSurfaceId) {
-                sActiveWindowSurfaceIds.remove(mBoundSurfaceId);
-            }
-            if (boundSurfaceId > 0) {
-                mBoundSurfaceId = boundSurfaceId;
-                sActiveWindowSurfaceIds.add(boundSurfaceId);
-                sAutoLaunchedSurfaceIds.add(boundSurfaceId);
-            }
+        sLastKnownSurfaceIds = surfaceIds;
+        sLastKnownTitles = titles;
+        sLastKnownAppIds = appIds;
+        for (int i = 0; i < surfaceIds.length; i++) {
+            String t = i < titles.length ? titles[i] : "";
+            String a = i < appIds.length ? appIds[i] : "";
+            sSurfaceAppLabels.put(surfaceIds[i], deriveAppLabel(t, a));
+        }
+        runOnUiThread(() -> populateAppSwitcherBarUi(surfaceIds, titles, appIds, boundSurfaceId));
+    }
 
-            if (mAppSwitcherBar == null) return;
-            StringBuilder sigBuilder = new StringBuilder();
-            sigBuilder.append(boundSurfaceId).append('|');
-            for (int i = 0; i < surfaceIds.length; i++) {
-                String t = i < titles.length ? titles[i] : "";
-                String a = i < appIds.length ? appIds[i] : "";
-                sigBuilder.append(surfaceIds[i]).append(':').append(deriveAppLabel(t, a)).append(';');
+    private void populateAppSwitcherBarUi(
+            int[] surfaceIds, String[] titles, String[] appIds, int boundSurfaceId) {
+        if (surfaceIds == null || titles == null || appIds == null) return;
+        if (mBoundSurfaceId > 0 && mBoundSurfaceId != boundSurfaceId) {
+            sActiveWindowSurfaceIds.remove(mBoundSurfaceId);
+        }
+        if (boundSurfaceId > 0) {
+            mBoundSurfaceId = boundSurfaceId;
+            sActiveWindowSurfaceIds.add(boundSurfaceId);
+        }
+
+        if (mAppSwitcherBar == null) return;
+        StringBuilder sigBuilder = new StringBuilder();
+        sigBuilder.append(boundSurfaceId).append('|');
+        for (int i = 0; i < surfaceIds.length; i++) {
+            String t = i < titles.length ? titles[i] : "";
+            String a = i < appIds.length ? appIds[i] : "";
+            sigBuilder.append(surfaceIds[i]).append(':').append(deriveAppLabel(t, a)).append(';');
+        }
+        String sig = sigBuilder.toString();
+        if (sig.equals(mLastSwitcherSignature) && mAppSwitcherBar.getChildCount() > 0) {
+            return;
+        }
+        mLastSwitcherSignature = sig;
+
+        mAppSwitcherBar.removeAllViews();
+        final float dp = getResources().getDisplayMetrics().density;
+        final boolean night = isNightMode();
+
+        for (int i = 0; i < surfaceIds.length; i++) {
+            final int sid = surfaceIds[i];
+            final String t = i < titles.length ? titles[i] : "";
+            final String a = i < appIds.length ? appIds[i] : "";
+            final String shortLabel = deriveAppLabel(t, a);
+            final boolean selected = (sid == boundSurfaceId);
+
+            LinearLayout pill = new LinearLayout(this);
+            pill.setOrientation(LinearLayout.HORIZONTAL);
+            pill.setGravity(Gravity.CENTER_VERTICAL);
+            pill.setClickable(true);
+            pill.setFocusable(false);
+            pill.setPadding((int) (12 * dp), (int) (5 * dp), (int) (12 * dp), (int) (5 * dp));
+
+            GradientDrawable bg = new GradientDrawable();
+            bg.setCornerRadius(14 * dp);
+            if (selected) {
+                bg.setColor(night ? 0xFF2E5BFF : 0xFF1A73E8);
+            } else {
+                bg.setColor(night ? 0xFF2C2C35 : 0xFFDADCE0);
             }
-            String sig = sigBuilder.toString();
-            if (sig.equals(mLastSwitcherSignature) && mAppSwitcherBar.getChildCount() > 0) {
+            pill.setBackground(bg);
+
+            ImageView pillIcon = new ImageView(this);
+            Bitmap iconBmp = getSurfaceIconBitmap(sid, t, a);
+            if (iconBmp != null) {
+                pillIcon.setImageBitmap(iconBmp);
+            } else {
+                pillIcon.setImageResource(resolveFallbackIconRes(t, a));
+            }
+            LinearLayout.LayoutParams pilp =
+                    new LinearLayout.LayoutParams((int) (16 * dp), (int) (16 * dp));
+            pilp.setMarginEnd((int) (6 * dp));
+            pill.addView(pillIcon, pilp);
+
+            TextView pillText = new TextView(this);
+            pillText.setText(shortLabel);
+            pillText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            pillText.setTypeface(Typeface.DEFAULT, selected ? Typeface.BOLD : Typeface.NORMAL);
+            pillText.setTextColor(selected ? 0xFFFFFFFF : (night ? 0xFFD0D0D8 : 0xFF202124));
+            pill.addView(pillText);
+
+            pill.setOnClickListener(v -> switchToWaylandSurface(sid, shortLabel));
+            pill.setOnTouchListener((v, ev) -> {
+                if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                    switchToWaylandSurface(sid, shortLabel);
+                    return true;
+                }
+                return false;
+            });
+
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.setMarginEnd((int) (8 * dp));
+            mAppSwitcherBar.addView(pill, lp);
+        }
+
+        if (surfaceIds.length >= 2) {
+            TextView popBtn = new TextView(this);
+            popBtn.setText("⧉ Open Window");
+            popBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            popBtn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            popBtn.setTextColor(night ? 0xFF8AB4F8 : 0xFF1A73E8);
+            popBtn.setClickable(true);
+            popBtn.setFocusable(false);
+            popBtn.setPadding((int) (12 * dp), (int) (5 * dp), (int) (12 * dp), (int) (5 * dp));
+            GradientDrawable popBg = new GradientDrawable();
+            popBg.setCornerRadius(14 * dp);
+            popBg.setStroke((int) (1 * dp), night ? 0xFF8AB4F8 : 0xFF1A73E8);
+            popBtn.setBackground(popBg);
+            popBtn.setOnClickListener(v -> openNextUnboundSurfaceWindow(surfaceIds, boundSurfaceId));
+            popBtn.setOnTouchListener((v, ev) -> {
+                if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                    openNextUnboundSurfaceWindow(surfaceIds, boundSurfaceId);
+                    return true;
+                }
+                return false;
+            });
+            mAppSwitcherBar.addView(popBtn);
+        }
+    }
+
+    private void finishPendingActivityNow() {
+        MainActivity pending = sPendingFinishActivity;
+        if (pending != null && pending != this) {
+            sPendingFinishActivity = null;
+            pending.runOnUiThread(() -> {
+                try {
+                    if (!pending.isFinishing() && !pending.isDestroyed()) {
+                        pending.finishAndRemoveTask();
+                        pending.overridePendingTransition(0, 0);
+                    }
+                } catch (Throwable ignored) {
+                }
+            });
+        }
+    }
+
+    /**
+     * Invoked from native JNI right after the initial Vulkan frame has been rendered and presented
+     * onto this Activity's SurfaceView. If a previous single-window Activity was waiting underneath
+     * to be replaced, we finish it now that our frame is already visible on screen.
+     */
+    @SuppressWarnings("unused")
+    public void onFirstVulkanFramePresented() {
+        runOnUiThread(this::finishPendingActivityNow);
+    }
+
+    private void switchToWaylandSurface(int sid, String shortLabel) {
+        if (sid <= 0) return;
+        Class<? extends MainActivity> targetClass = getActivityClassForLabel(shortLabel);
+        if (targetClass != getClass()) {
+            try {
+                cancelPendingDockOrderAndClearExclusions();
+                sLastTransitionStartMs = System.currentTimeMillis();
+                MainActivity existingOther = findOpenActivityByClass(targetClass);
+                Intent intent = new Intent(this, targetClass);
+                intent.setData(Uri.parse("vkwlf://surface/" + sid));
+                intent.putExtra("target_surface_id", sid);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
+                if (existingOther == null) {
+                    Rect bounds = getWindowManager().getCurrentWindowMetrics().getBounds();
+                    ActivityOptions ao = ActivityOptions.makeCustomAnimation(this, 0, 0);
+                    if (bounds != null && !bounds.isEmpty()) {
+                        ao.setLaunchBounds(bounds);
+                    }
+                    sPendingFinishActivity = this;
+                    sActiveSlotActivities.remove(mWindowSlot, this);
+                    startActivity(intent, ao.toBundle());
+                    overridePendingTransition(0, 0);
+                } else {
+                    existingOther.mIsBackgroundRecycle = false;
+                    sSuppressFocusPromoteUntilMs = 0L;
+                    sCurrentDockLeaderTaskId = -1;
+                    sDesiredForegroundActivity = existingOther;
+                    existingOther.handleIntentTargetSurface(intent);
+                    bringActivityToFront(existingOther);
+                    existingOther.markAsForegroundTaskForDock();
+                }
                 return;
+            } catch (Throwable t) {
+                Log.w(TAG, "Failed to switch Activity for surface " + sid, t);
             }
-            mLastSwitcherSignature = sig;
-
-            mAppSwitcherBar.removeAllViews();
-            final float dp = getResources().getDisplayMetrics().density;
-            final boolean night = isNightMode();
-
-            for (int i = 0; i < surfaceIds.length; i++) {
-                final int sid = surfaceIds[i];
-                final String t = i < titles.length ? titles[i] : "";
-                final String a = i < appIds.length ? appIds[i] : "";
-                final String shortLabel = deriveAppLabel(t, a);
-                final boolean selected = (sid == boundSurfaceId);
-
-                LinearLayout pill = new LinearLayout(this);
-                pill.setOrientation(LinearLayout.HORIZONTAL);
-                pill.setGravity(Gravity.CENTER_VERTICAL);
-                pill.setClickable(true);
-                pill.setFocusable(false);
-                pill.setPadding((int) (12 * dp), (int) (5 * dp), (int) (12 * dp), (int) (5 * dp));
-
-                GradientDrawable bg = new GradientDrawable();
-                bg.setCornerRadius(14 * dp);
-                if (selected) {
-                    bg.setColor(night ? 0xFF2E5BFF : 0xFF1A73E8);
-                } else {
-                    bg.setColor(night ? 0xFF2C2C35 : 0xFFDADCE0);
-                }
-                pill.setBackground(bg);
-
-                ImageView pillIcon = new ImageView(this);
-                Bitmap iconBmp = getSurfaceIconBitmap(sid, t, a);
-                if (iconBmp != null) {
-                    pillIcon.setImageBitmap(iconBmp);
-                } else {
-                    pillIcon.setImageResource(resolveFallbackIconRes(t, a));
-                }
-                LinearLayout.LayoutParams pilp =
-                        new LinearLayout.LayoutParams((int) (16 * dp), (int) (16 * dp));
-                pilp.setMarginEnd((int) (6 * dp));
-                pill.addView(pillIcon, pilp);
-
-                TextView pillText = new TextView(this);
-                pillText.setText(shortLabel);
-                pillText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-                pillText.setTypeface(Typeface.DEFAULT, selected ? Typeface.BOLD : Typeface.NORMAL);
-                pillText.setTextColor(selected ? 0xFFFFFFFF : (night ? 0xFFD0D0D8 : 0xFF202124));
-                pill.addView(pillText);
-
-                pill.setOnClickListener(v -> {
-                    nativeSelectSurfaceForSlot(mWindowSlot, sid);
-                    mSurfaceView.requestFocus();
-                });
-                pill.setOnTouchListener((v, ev) -> {
-                    if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                        nativeSelectSurfaceForSlot(mWindowSlot, sid);
-                        mSurfaceView.requestFocus();
-                        return true;
-                    }
-                    return false;
-                });
-
-                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                lp.setMarginEnd((int) (8 * dp));
-                mAppSwitcherBar.addView(pill, lp);
-            }
-
-            if (surfaceIds.length >= 2) {
-                TextView popBtn = new TextView(this);
-                popBtn.setText("⧉ Open Window");
-                popBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-                popBtn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-                popBtn.setTextColor(night ? 0xFF8AB4F8 : 0xFF1A73E8);
-                popBtn.setClickable(true);
-                popBtn.setFocusable(false);
-                popBtn.setPadding((int) (12 * dp), (int) (5 * dp), (int) (12 * dp), (int) (5 * dp));
-                GradientDrawable popBg = new GradientDrawable();
-                popBg.setCornerRadius(14 * dp);
-                popBg.setStroke((int) (1 * dp), night ? 0xFF8AB4F8 : 0xFF1A73E8);
-                popBtn.setBackground(popBg);
-                popBtn.setOnClickListener(v -> openNextUnboundSurfaceWindow(surfaceIds, boundSurfaceId));
-                popBtn.setOnTouchListener((v, ev) -> {
-                    if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
-                        openNextUnboundSurfaceWindow(surfaceIds, boundSurfaceId);
-                        return true;
-                    }
-                    return false;
-                });
-                mAppSwitcherBar.addView(popBtn);
-
-                if (mWindowSlot == 0 && isInMultiWindowMode()) {
-                    int delayMs = 350;
-                    for (int sid : surfaceIds) {
-                        if (sid != boundSurfaceId && sAutoLaunchedSurfaceIds.add(sid)) {
-                            final int targetSid = sid;
-                            mRoot.postDelayed(() -> openWindowForSurface(targetSid), delayMs);
-                            delayMs += 300;
-                        }
-                    }
-                }
-            }
-        });
+        }
+        markAsForegroundTaskForDock();
+        nativeSelectSurfaceForSlot(mWindowSlot, sid);
+        mSurfaceView.requestFocus();
     }
 
     private void openNextUnboundSurfaceWindow(int[] surfaceIds, int currentBoundSid) {
@@ -597,11 +988,57 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void openWindowForSurface(int targetSid) {
         if (targetSid <= 0) return;
         try {
-            Intent intent = new Intent(this, SecondaryWaylandActivity.class);
+            cancelPendingDockOrderAndClearExclusions();
+            sLastTransitionStartMs = System.currentTimeMillis();
+            String label = sSurfaceAppLabels.get(targetSid);
+            if (label == null || label.isEmpty()) {
+                label = (getPreferredWindowSlot() == 1) ? "Antigravity" : "TeamViewer";
+            }
+            Class<? extends MainActivity> targetClass = getActivityClassForLabel(label);
+            MainActivity existing = findOpenActivityByClass(targetClass);
+            Intent intent = new Intent(this, targetClass);
             intent.setData(Uri.parse("vkwlf://surface/" + targetSid));
             intent.putExtra("target_surface_id", targetSid);
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT);
-            startActivity(intent);
+            if (existing != null) {
+                existing.mIsBackgroundRecycle = false;
+                sSuppressFocusPromoteUntilMs = 0L;
+                sCurrentDockLeaderTaskId = -1;
+                sDesiredForegroundActivity = existing;
+                existing.handleIntentTargetSurface(intent);
+                bringActivityToFront(existing);
+                existing.markAsForegroundTaskForDock();
+                return;
+            }
+            Bundle opts = null;
+            Rect cur = getWindowManager().getCurrentWindowMetrics().getBounds();
+            Rect max = getWindowManager().getMaximumWindowMetrics().getBounds();
+            if (cur != null && !cur.isEmpty()) {
+                float dp = getResources().getDisplayMetrics().density;
+                int dx = (int) (80 * dp);
+                int dy = (int) (56 * dp);
+                Rect next = new Rect(cur);
+                if (max != null && !max.isEmpty() && next.right + dx > max.right - (int) (24 * dp)) {
+                    dx = -dx;
+                }
+                if (max != null && !max.isEmpty() && next.bottom + dy > max.bottom - (int) (80 * dp)) {
+                    dy = -dy;
+                }
+                next.offset(dx, dy);
+                if (max != null && !max.isEmpty()) {
+                    if (next.left < max.left + (int) (16 * dp)) {
+                        next.offsetTo(max.left + (int) (16 * dp), next.top);
+                    }
+                    if (next.top < max.top + (int) (48 * dp)) {
+                        next.offsetTo(next.left, max.top + (int) (48 * dp));
+                    }
+                }
+                ActivityOptions ao = ActivityOptions.makeCustomAnimation(this, 0, 0);
+                ao.setLaunchBounds(next);
+                opts = ao.toBundle();
+            }
+            startActivity(intent, opts);
+            overridePendingTransition(0, 0);
         } catch (Throwable t) {
             Log.w(TAG, "Failed to launch Wayland window for surface " + targetSid, t);
         }
@@ -614,23 +1051,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @SuppressWarnings({"deprecation", "unused"})
     public void onWaylandAppInfo(int surfaceId, String title, String appId, byte[] iconPng) {
         final String shortLabel = deriveAppLabel(title, appId);
-        Bitmap decodedIcon = null;
-        if (iconPng != null && iconPng.length > 0) {
+        final String cacheKey = surfaceId + "|" + shortLabel;
+        if (surfaceId > 0) {
+            sSurfaceAppLabels.put(surfaceId, shortLabel);
+        }
+        Bitmap decodedIcon = (surfaceId > 0) ? sSurfaceIconCache.get(cacheKey) : null;
+        if (decodedIcon == null && iconPng != null && iconPng.length > 0) {
             decodedIcon = BitmapFactory.decodeByteArray(iconPng, 0, iconPng.length);
             if (decodedIcon != null && surfaceId > 0) {
-                sSurfaceIconCache.put(surfaceId, decodedIcon);
+                sSurfaceIconCache.put(cacheKey, decodedIcon);
             }
         }
         if (decodedIcon == null) {
             decodedIcon = getSurfaceIconBitmap(surfaceId, title, appId);
         }
         final Bitmap finalIcon = decodedIcon;
-        final byte[] iconBytesCopy =
-                (iconPng != null && iconPng.length > 0) ? Arrays.copyOf(iconPng, iconPng.length) : null;
         final String appIdCopy = (appId != null) ? appId : "";
 
         runOnUiThread(() -> {
-            setTitle(shortLabel);
+            boolean labelChanged = !shortLabel.equals(getTitle());
+            boolean iconChanged = (finalIcon != null && finalIcon != mCurrentIconBitmap);
+            if (labelChanged) {
+                setTitle(shortLabel);
+            }
             if (finalIcon != null) {
                 mCurrentIconBitmap = finalIcon;
             }
@@ -640,68 +1083,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             } else {
                 mHeaderIcon.setImageResource(resolveFallbackIconRes(title, appIdCopy));
             }
-            if (mCurrentIconBitmap != null) {
-                setTaskDescription(new ActivityManager.TaskDescription(shortLabel, mCurrentIconBitmap));
-            } else {
-                setTaskDescription(new ActivityManager.TaskDescription(shortLabel));
+            if (labelChanged || iconChanged) {
+                if (mCurrentIconBitmap != null) {
+                    setTaskDescription(
+                            new ActivityManager.TaskDescription(shortLabel, mCurrentIconBitmap));
+                } else {
+                    setTaskDescription(new ActivityManager.TaskDescription(shortLabel));
+                }
             }
             if (!appIdCopy.isEmpty()) {
                 mLastAppId = appIdCopy;
             }
-            applyDynamicAppOverlay(shortLabel, iconBytesCopy);
         });
-    }
-
-    /** @return true if an overlay with the given label was committed. */
-    private boolean applyDynamicAppOverlay(String label, byte[] iconPng) {
-        try {
-            if (iconPng != null && iconPng.length > 0) {
-                mLastOverlayIconBytes = iconPng;
-            }
-            if (mLastOverlayIconBytes == null || mLastOverlayIconBytes.length == 0) {
-                return false;
-            }
-            if (label.equals(mLastOverlayLabel) && iconPng == null) {
-                return false;
-            }
-            mLastOverlayLabel = label;
-
-            File iconFile = new File(
-                    getCacheDir(), "wayland_app_icon_slot" + mWindowSlot + ".png");
-            try (FileOutputStream fos = new FileOutputStream(iconFile)) {
-                fos.write(mLastOverlayIconBytes);
-                fos.flush();
-            }
-
-            OverlayManager om = getSystemService(OverlayManager.class);
-            if (om != null) {
-                FabricatedOverlay overlay =
-                        new FabricatedOverlay(getOverlayName(), getPackageName());
-                overlay.setTargetOverlayable("WaylandDynamicAppMeta");
-                overlay.setResourceValue(
-                        getOverlayLabelResource(),
-                        TypedValue.TYPE_STRING,
-                        label,
-                        null);
-                try (ParcelFileDescriptor pfd =
-                        ParcelFileDescriptor.open(iconFile, ParcelFileDescriptor.MODE_READ_ONLY)) {
-                    overlay.setResourceValue(
-                            getOverlayIconResource(),
-                            pfd,
-                            null);
-                    OverlayManagerTransaction tx = OverlayManagerTransaction.newInstance();
-                    tx.registerFabricatedOverlay(overlay);
-                    om.commit(tx);
-                    Log.i(TAG, "[Slot " + mWindowSlot
-                            + "] Committed FabricatedOverlay for dynamic Wayland app icon and label='"
-                            + label + "' (" + mLastOverlayIconBytes.length + " bytes)");
-                    return true;
-                }
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "Failed to apply FabricatedOverlay for dynamic Wayland app icon", t);
-        }
-        return false;
     }
 
     @Override
@@ -709,8 +1102,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         Surface surface = holder.getSurface();
         nativeOnSurfaceCreatedForSlot(
                 mWindowSlot, surface, mSurfaceView.getWidth(), mSurfaceView.getHeight());
+        if (sPendingFinishActivity != null && sPendingFinishActivity != this) {
+            mRoot.postDelayed(this::finishPendingActivityNow, 220);
+        }
         if (mWindowSlot == 0) {
-            ensureDirectHostWaylandClientRunning();
+            Thread clientLaunchThread =
+                    new Thread(this::ensureDirectHostWaylandClientRunning, "VkWlfClientLauncher");
+            clientLaunchThread.setDaemon(true);
+            clientLaunchThread.start();
         }
     }
 

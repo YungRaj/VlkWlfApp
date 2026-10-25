@@ -2572,7 +2572,6 @@ int WaylandServerEngine::OnBridgeClientDataEvent(int fd, uint32_t /*mask*/, void
             .stride = frame.stride,
             .modifier = 0,
         });
-        frame.shm_pixels = std::move(payload);
       } else {
         close(mfd);
         frame.buffer_type = BufferType::kShm;

@@ -559,10 +559,17 @@ bool VkRenderer::CreateSwapchainOrOffscreenTarget() {
     swapchain_image_views_ = {offscreen_view_};
   }
 
-  // Create a full-frame readback buffer so we can sample pixels and dump rendered swapchain frames.
+  // Create a readback buffer so we can sample pixels and dump rendered swapchain frames.
   VkBufferCreateInfo rb_info{};
   rb_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+#ifdef __ANDROID__
+  rb_info.size = use_swapchain_
+                     ? sizeof(uint32_t)
+                     : static_cast<VkDeviceSize>(swapchain_extent_.width) *
+                           swapchain_extent_.height * 4;
+#else
   rb_info.size = static_cast<VkDeviceSize>(swapchain_extent_.width) * swapchain_extent_.height * 4;
+#endif
   rb_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   rb_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   if (vkCreateBuffer(device_, &rb_info, nullptr, &readback_buffer_) == VK_SUCCESS) {
@@ -2113,8 +2120,17 @@ bool VkRenderer::RecordAndSubmitRenderPass(uint32_t image_index, const SurfaceTe
 
   vkCmdEndRenderPass(render_cmd_buffer_);
 
+  bool should_sample_readback = !use_swapchain_;
+#ifdef __ANDROID__
+  if (use_swapchain_) {
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    uint64_t next_frame = stats_.frames_rendered + 1;
+    should_sample_readback = (next_frame <= 5) || (next_frame % 60 == 0);
+  }
+#endif
+
   // Copy center pixel to readback_buffer_ to verify non-zero GPU composition output.
-  if (readback_buffer_ != VK_NULL_HANDLE) {
+  if (readback_buffer_ != VK_NULL_HANDLE && should_sample_readback) {
     VkImage src_img = swapchain_images_[image_index];
     VkImageLayout cur_layout =
         use_swapchain_ ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -2195,9 +2211,8 @@ bool VkRenderer::RecordAndSubmitRenderPass(uint32_t image_index, const SurfaceTe
     return false;
   }
 
-  vkWaitForFences(device_, 1, &in_flight_fence_, VK_TRUE, UINT64_MAX);
-
-  if (readback_memory_ != VK_NULL_HANDLE) {
+  if (readback_memory_ != VK_NULL_HANDLE && should_sample_readback) {
+    vkWaitForFences(device_, 1, &in_flight_fence_, VK_TRUE, UINT64_MAX);
     uint32_t pixel = 0;
     void* ptr = nullptr;
 #ifdef __ANDROID__
