@@ -81,6 +81,23 @@
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|colorMode|locale|mcc|mnc|touchscreen" />
 
         <activity
+            android:name=".GimpWaylandActivity"
+            android:label="@string/app_name_gimp"
+            android:icon="@drawable/ic_app_gimp"
+            android:roundIcon="@drawable/ic_app_gimp"
+            android:taskAffinity="com.google.example.vkwlf.task.gimp"
+            android:launchMode="singleTop"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="true"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|colorMode|locale|mcc|mnc|touchscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
             android:name=".GenericWaylandActivity"
             android:label="@string/wayland_app_name"
             android:icon="@drawable/ic_wayland_app"

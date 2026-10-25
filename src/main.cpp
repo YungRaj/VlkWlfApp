@@ -53,7 +53,7 @@ struct AppBridgeState {
   std::unique_ptr<vkwlf::InputHandler> input;
   std::mutex slots_mutex;
   std::map<int, WindowSlot> slots;
-  std::atomic<int> next_dynamic_slot_id{6};
+  std::atomic<int> next_dynamic_slot_id{8};
   std::thread pump_thread;
   std::atomic<bool> pump_running{false};
   std::mutex cache_mutex;
@@ -117,6 +117,32 @@ vkwlf::CommittedFrame CloneFrameForRenderer(const vkwlf::CommittedFrame& src,
   return copy;
 }
 
+std::vector<vkwlf::CommittedFrame> CollectReplayFramesForTargetLocked(uint32_t target_sid) {
+  std::vector<vkwlf::CommittedFrame> frames;
+  // Pass 1: Parent/base toplevel frames first so child subsurfaces (even with lower surface IDs,
+  // e.g. Firefox's WebRender subsurface sid=10 under xdg_toplevel sid=13) render on top.
+  for (const auto& [sid, cached] : g_app.cached_frames) {
+    if (target_sid == 0) {
+      if (!cached.is_subsurface && cached.parent_surface_id == 0) {
+        frames.push_back(CloneFrameForRenderer(cached));
+      }
+    } else if (sid == target_sid) {
+      frames.push_back(CloneFrameForRenderer(cached));
+    }
+  }
+  // Pass 2: Child subsurfaces/popups second.
+  for (const auto& [sid, cached] : g_app.cached_frames) {
+    if (target_sid == 0) {
+      if (cached.is_subsurface || cached.parent_surface_id != 0) {
+        frames.push_back(CloneFrameForRenderer(cached));
+      }
+    } else if (sid != target_sid && cached.parent_surface_id == target_sid) {
+      frames.push_back(CloneFrameForRenderer(cached));
+    }
+  }
+  return frames;
+}
+
 std::string CanonicalAppKey(const vkwlf::CommittedFrame& f) {
   std::string app_low = f.app_id;
   for (char& c : app_low) {
@@ -130,6 +156,10 @@ std::string CanonicalAppKey(const vkwlf::CommittedFrame& f) {
   if (combined.find("teamviewer") != std::string::npos) return "teamviewer";
   if (combined.find("antigravity") != std::string::npos) return "antigravity";
   if (combined.find("firefox") != std::string::npos) return "firefox";
+  if (combined.find("gimp") != std::string::npos ||
+      combined.find("image manipulation") != std::string::npos) {
+    return "gimp";
+  }
   if (combined.find("vscode") != std::string::npos ||
       combined.find("visual studio code") != std::string::npos || app_low == "code") {
     return "vscode";
@@ -364,6 +394,12 @@ void UpdateSlotAssignmentsAndNotify() {
   };
   std::vector<PendingNotification> notifications;
 
+  struct PendingReplay {
+    std::shared_ptr<vkwlf::VkRenderer> renderer;
+    uint32_t surface_id;
+  };
+  std::vector<PendingReplay> pending_replays;
+
   {
     std::lock_guard<std::mutex> lock(g_app.slots_mutex);
     std::set<uint32_t> claimed_sids;
@@ -393,6 +429,8 @@ void UpdateSlotAssignmentsAndNotify() {
       uint32_t desired_sid = slot.target_surface_id;
       if (!current_valid || !slot.user_pinned_surface) {
         uint32_t picked = 0;
+        const bool is_dedicated_secondary_slot =
+            (slot_id == 1 || slot_id == 2 || slot_id == 3 || slot_id == 6);
         for (const auto& app : base_apps) {
           std::string key = CanonicalAppKey(app);
           bool matches_slot = false;
@@ -404,9 +442,11 @@ void UpdateSlotAssignmentsAndNotify() {
             matches_slot = (key == "firefox");
           } else if (slot_id == 3) {
             matches_slot = (key == "vscode");
+          } else if (slot_id == 6) {
+            matches_slot = (key == "gimp");
           } else {
             matches_slot = (key != "antigravity" && key != "teamviewer" &&
-                            key != "firefox" && key != "vscode");
+                            key != "firefox" && key != "vscode" && key != "gimp");
           }
           if (matches_slot && claimed_sids.find(app.surface_id) == claimed_sids.end()) {
             picked = app.surface_id;
@@ -414,7 +454,7 @@ void UpdateSlotAssignmentsAndNotify() {
             break;
           }
         }
-        if (picked == 0) {
+        if (picked == 0 && !is_dedicated_secondary_slot) {
           for (const auto& app : base_apps) {
             if (claimed_sids.find(app.surface_id) == claimed_sids.end()) {
               picked = app.surface_id;
@@ -423,7 +463,7 @@ void UpdateSlotAssignmentsAndNotify() {
             }
           }
         }
-        if (picked == 0) {
+        if (picked == 0 && !is_dedicated_secondary_slot) {
           picked = base_apps[ordinal % base_apps.size()].surface_id;
         }
         desired_sid = picked;
@@ -433,6 +473,9 @@ void UpdateSlotAssignmentsAndNotify() {
       slot.target_surface_id = desired_sid;
       if (slot.renderer) {
         slot.renderer->SetTargetSurfaceId(desired_sid);
+        if (sid_changed && desired_sid != 0) {
+          pending_replays.push_back(PendingReplay{slot.renderer, desired_sid});
+        }
       }
       for (const auto& app : base_apps) {
         if (app.surface_id == desired_sid) {
@@ -441,6 +484,22 @@ void UpdateSlotAssignmentsAndNotify() {
           break;
         }
       }
+    }
+  }
+
+  for (auto& pr : pending_replays) {
+    std::vector<vkwlf::CommittedFrame> replay_frames;
+    {
+      std::lock_guard<std::mutex> lock(g_app.cache_mutex);
+      replay_frames = CollectReplayFramesForTargetLocked(pr.surface_id);
+    }
+    if (!replay_frames.empty()) {
+      std::thread([renderer = std::move(pr.renderer),
+                   frames = std::move(replay_frames)]() mutable {
+        for (const auto& f : frames) {
+          renderer->ProcessAndPresentFrame(f);
+        }
+      }).detach();
     }
   }
 
@@ -836,12 +895,7 @@ void AttachWindowSlot(int slot_idx,
     std::vector<vkwlf::CommittedFrame> replay_frames;
     {
       std::lock_guard<std::mutex> lock(g_app.cache_mutex);
-      for (const auto& [sid, cached] : g_app.cached_frames) {
-        if (cur_target_sid == 0 || sid == cur_target_sid ||
-            cached.parent_surface_id == cur_target_sid) {
-          replay_frames.push_back(CloneFrameForRenderer(cached));
-        }
-      }
+      replay_frames = CollectReplayFramesForTargetLocked(cur_target_sid);
     }
 
     vkwlf::VkRenderer::Config vk_cfg;
@@ -929,6 +983,14 @@ void AttachWindowSlot(int slot_idx,
     } else {
       if (post_target_sid != cur_target_sid) {
         renderer->SetTargetSurfaceId(post_target_sid);
+        std::vector<vkwlf::CommittedFrame> post_frames;
+        {
+          std::lock_guard<std::mutex> lock(g_app.cache_mutex);
+          post_frames = CollectReplayFramesForTargetLocked(post_target_sid);
+        }
+        for (const auto& pf : post_frames) {
+          renderer->ProcessAndPresentFrame(pf);
+        }
       }
       if (post_w != cur_w || post_h != cur_h) {
         renderer->Resize(post_w, post_h);
@@ -1003,11 +1065,7 @@ void SelectSurfaceForWindowSlot(int slot_idx, uint32_t surface_id) {
       icon_png = it->second.icon_png;
       found = true;
     }
-    for (const auto& [sid, cached] : g_app.cached_frames) {
-      if (sid == surface_id || cached.parent_surface_id == surface_id) {
-        target_frames.push_back(CloneFrameForRenderer(cached));
-      }
-    }
+    target_frames = CollectReplayFramesForTargetLocked(surface_id);
   }
   uint32_t slot_w = 0;
   uint32_t slot_h = 0;

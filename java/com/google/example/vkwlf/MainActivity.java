@@ -221,6 +221,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (combined.contains("firefox")) {
             return R.drawable.ic_app_firefox;
         }
+        if (combined.contains("gimp") || combined.contains("image manipulation")) {
+            return R.drawable.ic_app_gimp;
+        }
         if (combined.contains("vscode")
                 || combined.contains("visual studio code")
                 || combined.contains("vs code")) {
@@ -240,6 +243,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 return R.drawable.ic_wayland_app;
             case 5:
                 return R.drawable.ic_wayland_app_2;
+            case 6:
+                return R.drawable.ic_app_gimp;
             default:
                 return R.drawable.ic_app_antigravity;
         }
@@ -257,6 +262,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 return getString(R.string.wayland_app_name);
             case 5:
                 return getString(R.string.wayland_app_name_2);
+            case 6:
+                return getString(R.string.app_name_gimp);
             default:
                 return getString(R.string.app_name_antigravity);
         }
@@ -277,6 +284,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
         if (low.contains("firefox")) {
             return FirefoxWaylandActivity.class;
+        }
+        if (low.contains("gimp")) {
+            return GimpWaylandActivity.class;
         }
         if (low.contains("vs code") || low.contains("vscode")) {
             return VSCodeWaylandActivity.class;
@@ -417,6 +427,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             resId = R.drawable.ic_app_teamviewer;
         } else if (lowerLabel.contains("firefox")) {
             resId = R.drawable.ic_app_firefox;
+        } else if (lowerLabel.contains("gimp")) {
+            resId = R.drawable.ic_app_gimp;
         } else if (lowerLabel.contains("vs code") || lowerLabel.contains("vscode")) {
             resId = R.drawable.ic_app_vscode;
         } else if (lowerLabel.contains("antigravity")) {
@@ -571,8 +583,65 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      *    notifyRecentTasksChanged() again, re-appending background taskIds after myTaskId so
      *    orderedRunningTaskIds = [myTaskId, bgTaskId...] and all tasks remain in Recents.
      */
+    private void cleanupOrphanAppTasks() {
+        try {
+            Rect myBounds = getWindowManager().getCurrentWindowMetrics().getBounds();
+            for (MainActivity act : sActiveSlotActivities.values()) {
+                if (act != null
+                        && act != this
+                        && act != sPendingFinishActivity
+                        && !act.isFinishing()
+                        && !act.isDestroyed()) {
+                    Rect otherBounds = act.getWindowManager().getCurrentWindowMetrics().getBounds();
+                    boolean sameBounds =
+                            myBounds != null
+                                    && !myBounds.isEmpty()
+                                    && myBounds.equals(otherBounds);
+                    boolean sameSurface =
+                            mBoundSurfaceId > 0 && act.mBoundSurfaceId == mBoundSurfaceId;
+                    if (sameBounds || sameSurface) {
+                        Log.i(TAG, "Finishing occluded/duplicate Activity "
+                                + act.getClass().getSimpleName()
+                                + " taskId=" + act.getTaskId());
+                        sActiveSlotActivities.remove(act.mWindowSlot, act);
+                        act.finishAndRemoveTask();
+                        act.overridePendingTransition(0, 0);
+                    }
+                }
+            }
+            ActivityManager am = getSystemService(ActivityManager.class);
+            if (am == null) return;
+            final int myTaskId = getTaskId();
+            final int pendingTaskId =
+                    (sPendingFinishActivity != null) ? sPendingFinishActivity.getTaskId() : -1;
+            for (ActivityManager.AppTask task : am.getAppTasks()) {
+                ActivityManager.RecentTaskInfo info = task.getTaskInfo();
+                if (info == null) continue;
+                int tid = (info.taskId != -1) ? info.taskId : info.id;
+                if (tid == myTaskId || tid == pendingTaskId) continue;
+                boolean matchedLive = false;
+                for (MainActivity act : sActiveSlotActivities.values()) {
+                    if (act != null
+                            && !act.isFinishing()
+                            && !act.isDestroyed()
+                            && act.getTaskId() == tid) {
+                        matchedLive = true;
+                        break;
+                    }
+                }
+                if (!matchedLive) {
+                    Log.i(TAG, "Finishing orphan AppTask taskId=" + tid);
+                    task.finishAndRemoveTask();
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Failed cleanupOrphanAppTasks", t);
+        }
+    }
+
     private void promoteToDockLeader() {
         if (isFinishing() || isDestroyed() || this == sPendingFinishActivity) return;
+        cleanupOrphanAppTasks();
         final int myTaskId = getTaskId();
         boolean hasOtherOpenWindow = false;
         for (MainActivity act : sActiveSlotActivities.values()) {
@@ -583,6 +652,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     && !act.isDestroyed()) {
                 hasOtherOpenWindow = true;
                 break;
+            }
+        }
+        if (!hasOtherOpenWindow) {
+            try {
+                ActivityManager am = getSystemService(ActivityManager.class);
+                if (am != null) {
+                    for (ActivityManager.AppTask task : am.getAppTasks()) {
+                        ActivityManager.RecentTaskInfo info = task.getTaskInfo();
+                        if (info != null) {
+                            int tid = (info.taskId != -1) ? info.taskId : info.id;
+                            if (tid != -1 && tid != myTaskId) {
+                                hasOtherOpenWindow = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
             }
         }
         if (!hasOtherOpenWindow) {
@@ -811,6 +898,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         super.onResume();
         if (this != sPendingFinishActivity) {
             markAsForegroundTaskForDock();
+            if (sPendingFinishActivity != null) {
+                sDockOrderHandler.postDelayed(this::finishPendingActivityNow, 300L);
+            }
         }
     }
 
@@ -858,7 +948,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (sCurrentDockLeaderTaskId == getTaskId()) {
             sCurrentDockLeaderTaskId = -1;
         }
-        clearAllAppTasksExcludeFromRecents();
+        if (sActiveSlotActivities.isEmpty()) {
+            clearAllAppTasksExcludeFromRecents();
+        }
         nativeReleaseWindowSlot(mWindowSlot);
         super.onDestroy();
     }
@@ -1155,8 +1247,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     }
                 } catch (Throwable ignored) {
                 }
-                self.runOnUiThread(self::markAsForegroundTaskForDock);
+                self.runOnUiThread(() -> {
+                    sCurrentDockLeaderTaskId = -1;
+                    self.cleanupOrphanAppTasks();
+                    self.markAsForegroundTaskForDock();
+                });
             });
+        } else {
+            cleanupOrphanAppTasks();
         }
     }
 
@@ -1233,6 +1331,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 ActivityOptions ao = ActivityOptions.makeCustomAnimation(this, 0, 0);
                 if (bounds != null && !bounds.isEmpty()) {
                     ao.setLaunchBounds(bounds);
+                }
+                MainActivity prevPending = sPendingFinishActivity;
+                if (prevPending != null && prevPending != this) {
+                    try {
+                        if (!prevPending.isFinishing() && !prevPending.isDestroyed()) {
+                            prevPending.finishAndRemoveTask();
+                            prevPending.overridePendingTransition(0, 0);
+                        }
+                    } catch (Throwable ignored) {
+                    }
                 }
                 sPendingFinishActivity = this;
                 sActiveSlotActivities.remove(mWindowSlot, this);
@@ -1390,7 +1498,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 sActiveWindowSurfaceIds.add(surfaceId);
                 Class<? extends MainActivity> expectedClass =
                         resolveActivityClassForSurface(surfaceId, title, appIdCopy);
-                if (expectedClass != getClass()
+                if (getClass() == MainActivity.class
+                        && expectedClass != getClass()
                         && !isFinishing()
                         && !isDestroyed()
                         && this != sPendingFinishActivity

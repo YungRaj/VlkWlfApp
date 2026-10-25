@@ -6,4 +6,5 @@
     <string name="app_name_teamviewer">TeamViewer</string>
     <string name="app_name_firefox">Firefox</string>
     <string name="app_name_vscode">VS Code</string>
+    <string name="app_name_gimp">GIMP</string>
 </resources>
