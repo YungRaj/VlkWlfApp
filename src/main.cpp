@@ -53,7 +53,7 @@ struct AppBridgeState {
   std::unique_ptr<vkwlf::InputHandler> input;
   std::mutex slots_mutex;
   std::map<int, WindowSlot> slots;
-  std::atomic<int> next_dynamic_slot_id{2};
+  std::atomic<int> next_dynamic_slot_id{6};
   std::thread pump_thread;
   std::atomic<bool> pump_running{false};
   std::mutex cache_mutex;
@@ -118,12 +118,32 @@ vkwlf::CommittedFrame CloneFrameForRenderer(const vkwlf::CommittedFrame& src,
 }
 
 std::string CanonicalAppKey(const vkwlf::CommittedFrame& f) {
-  std::string combined = f.app_id + " " + f.title;
-  for (char& c : combined) {
+  std::string app_low = f.app_id;
+  for (char& c : app_low) {
     if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
   }
+  std::string title_low = f.title;
+  for (char& c : title_low) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  std::string combined = app_low + " " + title_low;
   if (combined.find("teamviewer") != std::string::npos) return "teamviewer";
   if (combined.find("antigravity") != std::string::npos) return "antigravity";
+  if (combined.find("firefox") != std::string::npos) return "firefox";
+  if (combined.find("vscode") != std::string::npos ||
+      combined.find("visual studio code") != std::string::npos || app_low == "code") {
+    return "vscode";
+  }
+  if (!app_low.empty() && app_low != "xwayland" && app_low != "wlroots") {
+    return app_low;
+  }
+  if (!title_low.empty()) {
+    size_t dash = title_low.find(" - ");
+    if (dash != std::string::npos && dash > 0) {
+      return title_low.substr(0, dash);
+    }
+    return title_low;
+  }
   return "";
 }
 
@@ -373,29 +393,25 @@ void UpdateSlotAssignmentsAndNotify() {
       uint32_t desired_sid = slot.target_surface_id;
       if (!current_valid || !slot.user_pinned_surface) {
         uint32_t picked = 0;
-        // Prefer the Wayland app that matches the slot's default Activity identity:
-        // slot 0 (MainActivity) -> Antigravity (primary IDE)
-        // slot 1 (SecondaryWaylandActivity) -> TeamViewer (non-primary IDE)
         for (const auto& app : base_apps) {
-          bool matches_slot =
-              (slot_id == 0) ? is_primary_ide(app)
-                             : (slot_id == 1 && !is_primary_ide(app));
+          std::string key = CanonicalAppKey(app);
+          bool matches_slot = false;
+          if (slot_id == 0) {
+            matches_slot = (key == "antigravity");
+          } else if (slot_id == 1) {
+            matches_slot = (key == "teamviewer");
+          } else if (slot_id == 2) {
+            matches_slot = (key == "firefox");
+          } else if (slot_id == 3) {
+            matches_slot = (key == "vscode");
+          } else {
+            matches_slot = (key != "antigravity" && key != "teamviewer" &&
+                            key != "firefox" && key != "vscode");
+          }
           if (matches_slot && claimed_sids.find(app.surface_id) == claimed_sids.end()) {
             picked = app.surface_id;
             claimed_sids.insert(picked);
             break;
-          }
-        }
-        if (picked == 0) {
-          for (const auto& app : base_apps) {
-            bool matches_slot =
-                (slot_id == 0) ? is_primary_ide(app)
-                               : (slot_id == 1 && !is_primary_ide(app));
-            if (matches_slot) {
-              picked = app.surface_id;
-              claimed_sids.insert(picked);
-              break;
-            }
           }
         }
         if (picked == 0) {
@@ -553,6 +569,7 @@ void EnsureServerAndPumpStarted(const std::string& socket_path,
                 for (auto cit = g_app.cached_frames.begin(); cit != g_app.cached_frames.end();) {
                   if (cit->first != frame.surface_id && IsBaseToplevelFrame(cit->second) &&
                       CanonicalAppKey(cit->second) == new_key) {
+                    const uint32_t old_sid = cit->first;
                     if (frame.icon_png.empty() && !cit->second.icon_png.empty()) {
                       frame.icon_png = cit->second.icon_png;
                     }
@@ -561,6 +578,18 @@ void EnsureServerAndPumpStarted(const std::string& socket_path,
                       if (p.fd >= 0) close(p.fd);
                     }
                     cit = g_app.cached_frames.erase(cit);
+                    {
+                      std::lock_guard<std::mutex> slock(g_app.slots_mutex);
+                      for (auto& [sid_slot, s] : g_app.slots) {
+                        (void)sid_slot;
+                        if (s.target_surface_id == old_sid) {
+                          s.target_surface_id = frame.surface_id;
+                          if (s.renderer) {
+                            s.renderer->SetTargetSurfaceId(frame.surface_id);
+                          }
+                        }
+                      }
+                    }
                     topology_or_meta_changed = true;
                   } else {
                     ++cit;
@@ -963,7 +992,7 @@ void SelectSurfaceForWindowSlot(int slot_idx, uint32_t surface_id) {
   std::string title;
   std::string app_id;
   std::vector<uint8_t> icon_png;
-  vkwlf::CommittedFrame target_frame;
+  std::vector<vkwlf::CommittedFrame> target_frames;
   bool found = false;
   {
     std::lock_guard<std::mutex> lock(g_app.cache_mutex);
@@ -972,8 +1001,12 @@ void SelectSurfaceForWindowSlot(int slot_idx, uint32_t surface_id) {
       title = it->second.title;
       app_id = it->second.app_id;
       icon_png = it->second.icon_png;
-      target_frame = CloneFrameForRenderer(it->second);
       found = true;
+    }
+    for (const auto& [sid, cached] : g_app.cached_frames) {
+      if (sid == surface_id || cached.parent_surface_id == surface_id) {
+        target_frames.push_back(CloneFrameForRenderer(cached));
+      }
     }
   }
   uint32_t slot_w = 0;
@@ -991,17 +1024,21 @@ void SelectSurfaceForWindowSlot(int slot_idx, uint32_t surface_id) {
     renderer = slot.renderer;
   }
   if (renderer) {
-    std::thread([renderer = std::move(renderer), surface_id, found,
-                 frame = std::move(target_frame)]() mutable {
+    std::thread([renderer = std::move(renderer), surface_id,
+                 frames = std::move(target_frames)]() mutable {
       renderer->SetTargetSurfaceId(surface_id);
-      if (found) {
-        renderer->ProcessAndPresentFrame(frame);
+      if (!frames.empty()) {
+        for (const auto& f : frames) {
+          renderer->ProcessAndPresentFrame(f);
+        }
       } else {
         renderer->Repaint();
       }
     }).detach();
-  } else if (found) {
-    CloseFrameFds(target_frame);
+  } else {
+    for (auto& f : target_frames) {
+      CloseFrameFds(f);
+    }
   }
   if (g_app.server) {
     g_app.server->SetActiveInputSurface(surface_id);

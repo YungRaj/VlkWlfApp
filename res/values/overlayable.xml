@@ -3,11 +3,17 @@
     <overlayable name="WaylandDynamicAppMeta">
         <policy type="public">
             <item type="drawable" name="ic_wayland_app" />
+            <item type="drawable" name="ic_wayland_app_2" />
             <item type="drawable" name="ic_app_antigravity" />
             <item type="drawable" name="ic_app_teamviewer" />
+            <item type="drawable" name="ic_app_firefox" />
+            <item type="drawable" name="ic_app_vscode" />
             <item type="string" name="wayland_app_name" />
+            <item type="string" name="wayland_app_name_2" />
             <item type="string" name="app_name_antigravity" />
             <item type="string" name="app_name_teamviewer" />
+            <item type="string" name="app_name_firefox" />
+            <item type="string" name="app_name_vscode" />
         </policy>
     </overlayable>
 </resources>

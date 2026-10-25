@@ -10,12 +10,16 @@ import android.content.om.OverlayManagerTransaction;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
 import android.graphics.Insets;
+import android.graphics.Paint;
 import android.graphics.Rect;
+import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.ParcelFileDescriptor;
 import android.system.Os;
 import android.text.TextUtils;
 import android.util.Log;
@@ -56,8 +60,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final Set<Integer> sActiveWindowSurfaceIds =
             Collections.synchronizedSet(new HashSet<>());
     private static final Map<String, Bitmap> sSurfaceIconCache = new ConcurrentHashMap<>();
+    private static final Map<String, Bitmap> sLabelIconCache = new ConcurrentHashMap<>();
+    private static final Map<String, Bitmap> sGeneratedIconCache = new ConcurrentHashMap<>();
     private static final Map<Integer, Bitmap> sFallbackIconCache = new ConcurrentHashMap<>();
     private static final Map<Integer, String> sSurfaceAppLabels = new ConcurrentHashMap<>();
+    private static final Map<Integer, String> sGenericSlotOverlaySigs = new ConcurrentHashMap<>();
     private static final Map<Integer, MainActivity> sActiveSlotActivities =
             new ConcurrentHashMap<>();
     private static volatile MainActivity sPendingFinishActivity = null;
@@ -142,48 +149,241 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     /**
-     * Stable application label for the window caption / launcher overlay. Window titles change
-     * constantly ("App - file.txt"), so prefer the part before the first " - " / " — " separator,
-     * falling back to a capitalised app_id.
+     * Stable application label for any Wayland or X11 application. Window titles change constantly
+     * ("Page — Mozilla Firefox", "App - file.txt"), so we normalize known apps and extract a clean
+     * human-readable application name from appId or title.
      */
     private static String deriveAppLabel(String title, String appId) {
-        if (appId != null) {
-            String lowerId = appId.toLowerCase();
-            if (lowerId.contains("teamviewer")) return "TeamViewer";
-            if (lowerId.contains("antigravity")) return "Antigravity";
+        String combined =
+                ((appId != null ? appId : "") + " " + (title != null ? title : "")).toLowerCase();
+        if (combined.contains("teamviewer")) return "TeamViewer";
+        if (combined.contains("antigravity")) return "Antigravity";
+        if (combined.contains("firefox")) return "Firefox";
+        if (combined.contains("chromium")) return "Chromium";
+        if (combined.contains("google-chrome") || combined.contains("chrome")) return "Chrome";
+        if (combined.contains("gimp")) return "GIMP";
+        if (combined.contains("libreoffice")) return "LibreOffice";
+        if (combined.contains("vlc")) return "VLC";
+        if (combined.contains("code") || combined.contains("vscode")) return "VS Code";
+
+        if (appId != null && !appId.isEmpty()) {
+            String cleanId = appId.trim();
+            if (cleanId.endsWith(".desktop")) {
+                cleanId = cleanId.substring(0, cleanId.length() - 8);
+            }
+            int slash = cleanId.lastIndexOf('/');
+            if (slash >= 0 && slash + 1 < cleanId.length()) {
+                cleanId = cleanId.substring(slash + 1);
+            }
+            int dot = cleanId.lastIndexOf('.');
+            if (dot >= 0 && dot + 1 < cleanId.length()) {
+                cleanId = cleanId.substring(dot + 1);
+            }
+            cleanId = cleanId.replaceAll("(?i)-(esr|bin|wayland|x11)$", "");
+            String lowerClean = cleanId.toLowerCase();
+            if (!lowerClean.isEmpty()
+                    && !lowerClean.equals("xwayland")
+                    && !lowerClean.equals("wayland")
+                    && !lowerClean.equals("wlroots")) {
+                String spaced = cleanId.replace('-', ' ').replace('_', ' ').trim();
+                if (!spaced.isEmpty()) {
+                    return Character.toUpperCase(spaced.charAt(0)) + spaced.substring(1);
+                }
+            }
         }
         if (title != null && !title.isEmpty()) {
-            String lowerTitle = title.toLowerCase();
-            if (lowerTitle.contains("teamviewer")) return "TeamViewer";
-            if (lowerTitle.contains("antigravity")) return "Antigravity";
             String t = title;
-            for (String sep : new String[] {" - ", " — ", " – "}) {
-                int i = t.indexOf(sep);
-                if (i > 0) {
-                    t = t.substring(0, i);
+            for (String sep : new String[] {" — ", " – ", " - "}) {
+                int i = t.lastIndexOf(sep);
+                if (i > 0 && i + sep.length() < t.length()) {
+                    String suffix = t.substring(i + sep.length()).trim();
+                    String prefix = t.substring(0, i).trim();
+                    if (!suffix.isEmpty() && suffix.length() <= 28) {
+                        t = suffix;
+                    } else {
+                        t = prefix;
+                    }
+                    break;
                 }
             }
             t = t.replaceAll("\\s*\\[[^\\]]*\\]\\s*$", "").trim();
             if (!t.isEmpty()) return t;
         }
-        if (appId != null && !appId.isEmpty()) {
-            String last = appId.substring(appId.lastIndexOf('.') + 1).replace('-', ' ').replace('_', ' ');
-            return last.isEmpty() ? appId : Character.toUpperCase(last.charAt(0)) + last.substring(1);
-        }
         return "Antigravity";
     }
 
     private int resolveFallbackIconRes(String title, String appId) {
-        String combined = ((title != null ? title : "") + " " + (appId != null ? appId : "")).toLowerCase();
+        String combined =
+                ((title != null ? title : "") + " " + (appId != null ? appId : "")).toLowerCase();
         if (combined.contains("teamviewer")) {
             return R.drawable.ic_app_teamviewer;
+        }
+        if (combined.contains("firefox")) {
+            return R.drawable.ic_app_firefox;
+        }
+        if (combined.contains("vscode")
+                || combined.contains("visual studio code")
+                || combined.contains("vs code")) {
+            return R.drawable.ic_app_vscode;
         }
         if (combined.contains("antigravity")) {
             return R.drawable.ic_app_antigravity;
         }
-        return getPreferredWindowSlot() == 1
-                ? R.drawable.ic_app_teamviewer
-                : R.drawable.ic_app_antigravity;
+        switch (getPreferredWindowSlot()) {
+            case 1:
+                return R.drawable.ic_app_teamviewer;
+            case 2:
+                return R.drawable.ic_app_firefox;
+            case 3:
+                return R.drawable.ic_app_vscode;
+            case 4:
+                return R.drawable.ic_wayland_app;
+            case 5:
+                return R.drawable.ic_wayland_app_2;
+            default:
+                return R.drawable.ic_app_antigravity;
+        }
+    }
+
+    protected String getDefaultActivityLabel() {
+        switch (getPreferredWindowSlot()) {
+            case 1:
+                return getString(R.string.app_name_teamviewer);
+            case 2:
+                return getString(R.string.app_name_firefox);
+            case 3:
+                return getString(R.string.app_name_vscode);
+            case 4:
+                return getString(R.string.wayland_app_name);
+            case 5:
+                return getString(R.string.wayland_app_name_2);
+            default:
+                return getString(R.string.app_name_antigravity);
+        }
+    }
+
+    private Class<? extends MainActivity> resolveActivityClassForSurface(
+            int surfaceId, String titleOrLabel, String appId) {
+        String label = deriveAppLabel(titleOrLabel, appId);
+        if ((titleOrLabel == null || titleOrLabel.isEmpty())
+                && (appId == null || appId.isEmpty())
+                && surfaceId > 0
+                && sSurfaceAppLabels.containsKey(surfaceId)) {
+            label = sSurfaceAppLabels.get(surfaceId);
+        }
+        String low = (label != null ? label : "").toLowerCase();
+        if (low.contains("teamviewer")) {
+            return SecondaryWaylandActivity.class;
+        }
+        if (low.contains("firefox")) {
+            return FirefoxWaylandActivity.class;
+        }
+        if (low.contains("vs code") || low.contains("vscode")) {
+            return VSCodeWaylandActivity.class;
+        }
+        if (low.contains("antigravity")) {
+            return MainActivity.class;
+        }
+        MainActivity existingForSid = findOpenActivityBySurface(surfaceId);
+        if (existingForSid != null) {
+            return existingForSid.getClass();
+        }
+        if ((getClass() == GenericWaylandActivity.class
+                        || getClass() == GenericWaylandActivity2.class)
+                && (mBoundSurfaceId == surfaceId || mBoundSurfaceId <= 0)) {
+            return getClass();
+        }
+        if (getClass() == GenericWaylandActivity.class) {
+            return GenericWaylandActivity2.class;
+        }
+        if (getClass() == GenericWaylandActivity2.class) {
+            return GenericWaylandActivity.class;
+        }
+        if (!isActivityClassOpen(GenericWaylandActivity.class)) {
+            return GenericWaylandActivity.class;
+        }
+        return GenericWaylandActivity2.class;
+    }
+
+    private void applyGenericActivityOverlayIfNeeded(
+            Class<? extends MainActivity> targetClass, int sid, String label, Bitmap icon) {
+        if (targetClass != GenericWaylandActivity.class
+                && targetClass != GenericWaylandActivity2.class) {
+            return;
+        }
+        if (icon == null || label == null || label.isEmpty()) return;
+        final int slotNum = (targetClass == GenericWaylandActivity.class) ? 4 : 5;
+        final String sig = label + "|" + sid + "|" + icon.getGenerationId();
+        if (sig.equals(sGenericSlotOverlaySigs.get(slotNum))) {
+            return;
+        }
+        try {
+            OverlayManager om = getSystemService(OverlayManager.class);
+            if (om == null) return;
+            File iconFile = new File(getCacheDir(), "wayland_generic_slot" + slotNum + ".png");
+            try (FileOutputStream fos = new FileOutputStream(iconFile)) {
+                icon.compress(Bitmap.CompressFormat.PNG, 100, fos);
+                fos.flush();
+            }
+            String pkg = getPackageName();
+            String overlayName = "WaylandGenericOverlaySlot" + slotNum;
+            String drawableRes =
+                    (slotNum == 4)
+                            ? (pkg + ":drawable/ic_wayland_app")
+                            : (pkg + ":drawable/ic_wayland_app_2");
+            String stringRes =
+                    (slotNum == 4)
+                            ? (pkg + ":string/wayland_app_name")
+                            : (pkg + ":string/wayland_app_name_2");
+            try (ParcelFileDescriptor pfd =
+                    ParcelFileDescriptor.open(iconFile, ParcelFileDescriptor.MODE_READ_ONLY)) {
+                FabricatedOverlay overlay = new FabricatedOverlay(overlayName, pkg);
+                overlay.setTargetOverlayable("WaylandDynamicAppMeta");
+                overlay.setResourceValue(drawableRes, pfd, null);
+                overlay.setResourceValue(stringRes, TypedValue.TYPE_STRING, label, null);
+                OverlayManagerTransaction tx = OverlayManagerTransaction.newInstance();
+                tx.registerFabricatedOverlay(overlay);
+                om.commit(tx);
+                sGenericSlotOverlaySigs.put(slotNum, sig);
+                Log.i(TAG, "Committed generic Wayland app icon overlay for " + label
+                        + " on slot " + slotNum);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Failed to commit generic Wayland overlay for " + label, t);
+        }
+    }
+
+    private static Bitmap generateMonogramIconBitmap(String label) {
+        String clean = (label != null && !label.trim().isEmpty()) ? label.trim() : "W";
+        Bitmap existing = sGeneratedIconCache.get(clean);
+        if (existing != null) {
+            return existing;
+        }
+        final int size = 192;
+        Bitmap bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bmp);
+        final int[] palette = {
+            0xFFE65100, 0xFF1E88E5, 0xFF43A047, 0xFF8E24AA,
+            0xFFD81B60, 0xFF00897B, 0xFF3949AB, 0xFFF4511E
+        };
+        int color = palette[Math.abs(clean.hashCode()) % palette.length];
+        Paint bgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        bgPaint.setColor(color);
+        RectF rect = new RectF(12f, 12f, size - 12f, size - 12f);
+        canvas.drawRoundRect(rect, 42f, 42f, bgPaint);
+
+        Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        textPaint.setColor(0xFFFFFFFF);
+        textPaint.setTypeface(Typeface.create(Typeface.DEFAULT, Typeface.BOLD));
+        textPaint.setTextSize(108f);
+        textPaint.setTextAlign(Paint.Align.CENTER);
+        String letter = clean.substring(0, 1).toUpperCase();
+        Paint.FontMetrics fm = textPaint.getFontMetrics();
+        float centerY = (size / 2f) - ((fm.ascent + fm.descent) / 2f);
+        canvas.drawText(letter, size / 2f, centerY, textPaint);
+
+        sGeneratedIconCache.put(clean, bmp);
+        return bmp;
     }
 
     private Bitmap getSurfaceIconBitmap(int surfaceId, String title, String appId) {
@@ -200,28 +400,68 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     Bitmap decoded = BitmapFactory.decodeByteArray(png, 0, png.length);
                     if (decoded != null) {
                         sSurfaceIconCache.put(cacheKey, decoded);
+                        sLabelIconCache.put(label, decoded);
                         return decoded;
                     }
                 }
             } catch (Throwable ignored) {
             }
         }
-        int resId = resolveFallbackIconRes(title, appId);
-        Bitmap fallback = sFallbackIconCache.get(resId);
-        if (fallback == null) {
-            fallback = BitmapFactory.decodeResource(getResources(), resId);
+        Bitmap byLabel = sLabelIconCache.get(label);
+        if (byLabel != null) {
+            return byLabel;
+        }
+        String lowerLabel = label.toLowerCase();
+        int resId = 0;
+        if (lowerLabel.contains("teamviewer")) {
+            resId = R.drawable.ic_app_teamviewer;
+        } else if (lowerLabel.contains("firefox")) {
+            resId = R.drawable.ic_app_firefox;
+        } else if (lowerLabel.contains("vs code") || lowerLabel.contains("vscode")) {
+            resId = R.drawable.ic_app_vscode;
+        } else if (lowerLabel.contains("antigravity")) {
+            resId = R.drawable.ic_app_antigravity;
+        }
+        if (resId != 0) {
+            Bitmap fallback = sFallbackIconCache.get(resId);
+            if (fallback == null) {
+                fallback = BitmapFactory.decodeResource(getResources(), resId);
+                if (fallback != null) {
+                    sFallbackIconCache.put(resId, fallback);
+                }
+            }
             if (fallback != null) {
-                sFallbackIconCache.put(resId, fallback);
+                return fallback;
             }
         }
-        return fallback;
+        return generateMonogramIconBitmap(label);
     }
 
-    private static Class<? extends MainActivity> getActivityClassForLabel(String shortLabel) {
-        if ("TeamViewer".equalsIgnoreCase(shortLabel)) {
-            return SecondaryWaylandActivity.class;
+    private static MainActivity findOpenActivityBySurface(int surfaceId) {
+        if (surfaceId <= 0) return null;
+        for (MainActivity act : sActiveSlotActivities.values()) {
+            if (act != null
+                    && act != sPendingFinishActivity
+                    && !act.isFinishing()
+                    && !act.isDestroyed()
+                    && act.mBoundSurfaceId == surfaceId) {
+                return act;
+            }
         }
-        return MainActivity.class;
+        return null;
+    }
+
+    private static MainActivity findOtherOpenActivity(MainActivity self) {
+        for (MainActivity act : sActiveSlotActivities.values()) {
+            if (act != null
+                    && act != self
+                    && act != sPendingFinishActivity
+                    && !act.isFinishing()
+                    && !act.isDestroyed()) {
+                return act;
+            }
+        }
+        return null;
     }
 
     private static boolean isActivityClassOpen(Class<? extends MainActivity> cls) {
@@ -430,8 +670,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         final int slot = mWindowSlot;
         final int initialTargetSid = resolveIntentTargetSurface(getIntent());
-        final String defaultLabel =
-                getString(slot == 1 ? R.string.app_name_teamviewer : R.string.app_name_antigravity);
+        final String defaultLabel = getDefaultActivityLabel();
         final String initialLabel =
                 (initialTargetSid > 0 && sSurfaceAppLabels.containsKey(initialTargetSid))
                         ? sSurfaceAppLabels.get(initialTargetSid)
@@ -440,6 +679,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         setTitle(initialLabel);
         if (initialIcon != null) {
             mCurrentIconBitmap = initialIcon;
+            applyGenericActivityOverlayIfNeeded(
+                    getClass(), initialTargetSid, initialLabel, initialIcon);
             setTaskDescription(new ActivityManager.TaskDescription(initialLabel, initialIcon));
         } else {
             setTaskDescription(new ActivityManager.TaskDescription(initialLabel));
@@ -491,8 +732,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (mCurrentIconBitmap != null) {
             mHeaderIcon.setImageBitmap(mCurrentIconBitmap);
         } else {
-            mHeaderIcon.setImageResource(
-                    slot == 1 ? R.drawable.ic_app_teamviewer : R.drawable.ic_app_antigravity);
+            mHeaderIcon.setImageResource(resolveFallbackIconRes(initialLabel, initialLabel));
         }
         LinearLayout.LayoutParams iconLp =
                 new LinearLayout.LayoutParams((int) (20 * dp), (int) (20 * dp));
@@ -906,6 +1146,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         MainActivity pending = sPendingFinishActivity;
         if (pending != null && pending != this) {
             sPendingFinishActivity = null;
+            final MainActivity self = this;
             pending.runOnUiThread(() -> {
                 try {
                     if (!pending.isFinishing() && !pending.isDestroyed()) {
@@ -914,6 +1155,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     }
                 } catch (Throwable ignored) {
                 }
+                self.runOnUiThread(self::markAsForegroundTaskForDock);
             });
         }
     }
@@ -930,43 +1172,92 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private void switchToWaylandSurface(int sid, String shortLabel) {
         if (sid <= 0) return;
-        Class<? extends MainActivity> targetClass = getActivityClassForLabel(shortLabel);
+        String resolvedLabel =
+                (shortLabel != null && !shortLabel.isEmpty())
+                        ? shortLabel
+                        : sSurfaceAppLabels.getOrDefault(sid, getTitle().toString());
+        if (resolvedLabel != null && !resolvedLabel.isEmpty()) {
+            sSurfaceAppLabels.put(sid, resolvedLabel);
+        }
+        Bitmap resolvedIcon = getSurfaceIconBitmap(sid, resolvedLabel, resolvedLabel);
+        Class<? extends MainActivity> targetClass =
+                resolveActivityClassForSurface(sid, resolvedLabel, resolvedLabel);
+
+        if (sid == mBoundSurfaceId && targetClass == getClass()) {
+            markAsForegroundTaskForDock();
+            nativeSelectSurfaceForSlot(mWindowSlot, sid);
+            mSurfaceView.requestFocus();
+            return;
+        }
+        MainActivity existingWithSurface = findOpenActivityBySurface(sid);
+        if (existingWithSurface != null
+                && existingWithSurface != this
+                && existingWithSurface.getClass() == targetClass) {
+            cancelPendingDockOrderAndClearExclusions();
+            existingWithSurface.mIsBackgroundRecycle = false;
+            sSuppressFocusPromoteUntilMs = 0L;
+            sCurrentDockLeaderTaskId = -1;
+            sDesiredForegroundActivity = existingWithSurface;
+            bringActivityToFront(existingWithSurface);
+            existingWithSurface.markAsForegroundTaskForDock();
+            return;
+        }
+        MainActivity existingByClass = findOpenActivityByClass(targetClass);
+        if (existingByClass != null && existingByClass != this) {
+            cancelPendingDockOrderAndClearExclusions();
+            existingByClass.mIsBackgroundRecycle = false;
+            sSuppressFocusPromoteUntilMs = 0L;
+            sCurrentDockLeaderTaskId = -1;
+            sDesiredForegroundActivity = existingByClass;
+            Intent rebindIntent = new Intent(this, targetClass);
+            rebindIntent.setData(Uri.parse("vkwlf://surface/" + sid));
+            rebindIntent.putExtra("target_surface_id", sid);
+            existingByClass.handleIntentTargetSurface(rebindIntent);
+            bringActivityToFront(existingByClass);
+            existingByClass.markAsForegroundTaskForDock();
+            return;
+        }
         if (targetClass != getClass()) {
             try {
                 cancelPendingDockOrderAndClearExclusions();
+                if (resolvedIcon != null) {
+                    applyGenericActivityOverlayIfNeeded(
+                            targetClass, sid, resolvedLabel, resolvedIcon);
+                }
                 sLastTransitionStartMs = System.currentTimeMillis();
-                MainActivity existingOther = findOpenActivityByClass(targetClass);
                 Intent intent = new Intent(this, targetClass);
                 intent.setData(Uri.parse("vkwlf://surface/" + sid));
                 intent.putExtra("target_surface_id", sid);
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
-                if (existingOther == null) {
-                    Rect bounds = getWindowManager().getCurrentWindowMetrics().getBounds();
-                    ActivityOptions ao = ActivityOptions.makeCustomAnimation(this, 0, 0);
-                    if (bounds != null && !bounds.isEmpty()) {
-                        ao.setLaunchBounds(bounds);
-                    }
-                    sPendingFinishActivity = this;
-                    sActiveSlotActivities.remove(mWindowSlot, this);
-                    startActivity(intent, ao.toBundle());
-                    overridePendingTransition(0, 0);
-                } else {
-                    existingOther.mIsBackgroundRecycle = false;
-                    sSuppressFocusPromoteUntilMs = 0L;
-                    sCurrentDockLeaderTaskId = -1;
-                    sDesiredForegroundActivity = existingOther;
-                    existingOther.handleIntentTargetSurface(intent);
-                    bringActivityToFront(existingOther);
-                    existingOther.markAsForegroundTaskForDock();
+                Rect bounds = getWindowManager().getCurrentWindowMetrics().getBounds();
+                ActivityOptions ao = ActivityOptions.makeCustomAnimation(this, 0, 0);
+                if (bounds != null && !bounds.isEmpty()) {
+                    ao.setLaunchBounds(bounds);
                 }
+                sPendingFinishActivity = this;
+                sActiveSlotActivities.remove(mWindowSlot, this);
+                startActivity(intent, ao.toBundle());
+                overridePendingTransition(0, 0);
                 return;
             } catch (Throwable t) {
                 Log.w(TAG, "Failed to switch Activity for surface " + sid, t);
             }
         }
+        if (mBoundSurfaceId > 0 && mBoundSurfaceId != sid) {
+            sActiveWindowSurfaceIds.remove(mBoundSurfaceId);
+        }
+        mBoundSurfaceId = sid;
+        sActiveWindowSurfaceIds.add(sid);
         markAsForegroundTaskForDock();
         nativeSelectSurfaceForSlot(mWindowSlot, sid);
         mSurfaceView.requestFocus();
+        if (resolvedIcon != null) {
+            mCurrentIconBitmap = resolvedIcon;
+            applyGenericActivityOverlayIfNeeded(getClass(), sid, resolvedLabel, resolvedIcon);
+            mHeaderIcon.setImageBitmap(resolvedIcon);
+            mHeaderTitle.setText(resolvedLabel);
+            setTitle(resolvedLabel);
+        }
     }
 
     private void openNextUnboundSurfaceWindow(int[] surfaceIds, int currentBoundSid) {
@@ -990,11 +1281,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         try {
             cancelPendingDockOrderAndClearExclusions();
             sLastTransitionStartMs = System.currentTimeMillis();
-            String label = sSurfaceAppLabels.get(targetSid);
-            if (label == null || label.isEmpty()) {
-                label = (getPreferredWindowSlot() == 1) ? "Antigravity" : "TeamViewer";
+            String label = sSurfaceAppLabels.getOrDefault(targetSid, "Wayland");
+            Bitmap icon = getSurfaceIconBitmap(targetSid, label, label);
+            Class<? extends MainActivity> targetClass =
+                    resolveActivityClassForSurface(targetSid, label, label);
+            MainActivity existingForSid = findOpenActivityBySurface(targetSid);
+            if (existingForSid != null
+                    && existingForSid != this
+                    && existingForSid.getClass() == targetClass) {
+                existingForSid.mIsBackgroundRecycle = false;
+                sSuppressFocusPromoteUntilMs = 0L;
+                sCurrentDockLeaderTaskId = -1;
+                sDesiredForegroundActivity = existingForSid;
+                bringActivityToFront(existingForSid);
+                existingForSid.markAsForegroundTaskForDock();
+                return;
             }
-            Class<? extends MainActivity> targetClass = getActivityClassForLabel(label);
+            if (targetClass == getClass()) {
+                // Current window is already the matching Activity class; pick an available window
+                // class for the other surface or generic slot.
+                targetClass =
+                        !isActivityClassOpen(GenericWaylandActivity.class)
+                                ? GenericWaylandActivity.class
+                                : GenericWaylandActivity2.class;
+            }
+            if (icon != null) {
+                applyGenericActivityOverlayIfNeeded(targetClass, targetSid, label, icon);
+            }
             MainActivity existing = findOpenActivityByClass(targetClass);
             Intent intent = new Intent(this, targetClass);
             intent.setData(Uri.parse("vkwlf://surface/" + targetSid));
@@ -1058,8 +1371,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         Bitmap decodedIcon = (surfaceId > 0) ? sSurfaceIconCache.get(cacheKey) : null;
         if (decodedIcon == null && iconPng != null && iconPng.length > 0) {
             decodedIcon = BitmapFactory.decodeByteArray(iconPng, 0, iconPng.length);
-            if (decodedIcon != null && surfaceId > 0) {
-                sSurfaceIconCache.put(cacheKey, decodedIcon);
+            if (decodedIcon != null) {
+                if (surfaceId > 0) {
+                    sSurfaceIconCache.put(cacheKey, decodedIcon);
+                }
+                sLabelIconCache.put(shortLabel, decodedIcon);
             }
         }
         if (decodedIcon == null) {
@@ -1069,6 +1385,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         final String appIdCopy = (appId != null) ? appId : "";
 
         runOnUiThread(() -> {
+            if (surfaceId > 0 && (mBoundSurfaceId <= 0 || mBoundSurfaceId == surfaceId)) {
+                mBoundSurfaceId = surfaceId;
+                sActiveWindowSurfaceIds.add(surfaceId);
+                Class<? extends MainActivity> expectedClass =
+                        resolveActivityClassForSurface(surfaceId, title, appIdCopy);
+                if (expectedClass != getClass()
+                        && !isFinishing()
+                        && !isDestroyed()
+                        && this != sPendingFinishActivity
+                        && sPendingFinishActivity == null
+                        && findOpenActivityByClass(expectedClass) == null) {
+                    switchToWaylandSurface(surfaceId, shortLabel);
+                    return;
+                }
+            }
             boolean labelChanged = !shortLabel.equals(getTitle());
             boolean iconChanged = (finalIcon != null && finalIcon != mCurrentIconBitmap);
             if (labelChanged) {
@@ -1085,8 +1416,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             if (labelChanged || iconChanged) {
                 if (mCurrentIconBitmap != null) {
+                    applyGenericActivityOverlayIfNeeded(
+                            getClass(), surfaceId, shortLabel, mCurrentIconBitmap);
                     setTaskDescription(
                             new ActivityManager.TaskDescription(shortLabel, mCurrentIconBitmap));
+                    mLastSwitcherSignature = "";
+                    int[] cachedSids = sLastKnownSurfaceIds;
+                    String[] cachedTitles = sLastKnownTitles;
+                    String[] cachedAppIds = sLastKnownAppIds;
+                    if (cachedSids != null && cachedTitles != null && cachedAppIds != null) {
+                        populateAppSwitcherBarUi(
+                                cachedSids, cachedTitles, cachedAppIds, mBoundSurfaceId);
+                    }
                 } else {
                     setTaskDescription(new ActivityManager.TaskDescription(shortLabel));
                 }
@@ -1105,12 +1446,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (sPendingFinishActivity != null && sPendingFinishActivity != this) {
             mRoot.postDelayed(this::finishPendingActivityNow, 220);
         }
-        if (mWindowSlot == 0) {
-            Thread clientLaunchThread =
-                    new Thread(this::ensureDirectHostWaylandClientRunning, "VkWlfClientLauncher");
-            clientLaunchThread.setDaemon(true);
-            clientLaunchThread.start();
-        }
+        Thread clientLaunchThread =
+                new Thread(this::ensureDirectHostWaylandClientRunning, "VkWlfClientLauncher");
+        clientLaunchThread.setDaemon(true);
+        clientLaunchThread.start();
     }
 
     @Override

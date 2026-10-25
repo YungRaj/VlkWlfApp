@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="wayland_app_name">&#160;</string>
+    <string name="wayland_app_name">Wayland</string>
+    <string name="wayland_app_name_2">Wayland</string>
     <string name="app_name_antigravity">Antigravity</string>
     <string name="app_name_teamviewer">TeamViewer</string>
+    <string name="app_name_firefox">Firefox</string>
+    <string name="app_name_vscode">VS Code</string>
 </resources>

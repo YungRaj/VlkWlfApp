@@ -291,9 +291,10 @@ int main(int argc, char** argv) {
       }
       return;
     }
-    if (!f.is_popup && !f.is_subsurface &&
+    if (!f.is_popup &&
         (!f.shm_pixels.empty() || f.dmabuf_fd >= 0) &&
-        f.parent_surface_id == 0 && f.width >= 320 && f.height >= 240) {
+        (f.parent_surface_id == 0 || f.is_subsurface) &&
+        f.width >= 320 && f.height >= 240) {
       auto it = last_toplevel_frames.find(f.surface_id);
       if (it != last_toplevel_frames.end()) {
         if (it->second.dmabuf_fd >= 0) close(it->second.dmabuf_fd);
@@ -341,7 +342,15 @@ int main(int argc, char** argv) {
 
       for (const auto& [sid, cached_frame] : last_toplevel_frames) {
         (void)sid;
-        vkwlf::WaylandServerEngine::SendFrameOverBridgeSocket(host_fd, cached_frame);
+        if (!cached_frame.is_subsurface) {
+          vkwlf::WaylandServerEngine::SendFrameOverBridgeSocket(host_fd, cached_frame);
+        }
+      }
+      for (const auto& [sid, cached_frame] : last_toplevel_frames) {
+        (void)sid;
+        if (cached_frame.is_subsurface) {
+          vkwlf::WaylandServerEngine::SendFrameOverBridgeSocket(host_fd, cached_frame);
+        }
       }
     }
 

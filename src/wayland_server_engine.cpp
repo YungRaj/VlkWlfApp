@@ -428,6 +428,10 @@ std::vector<uint8_t> ResolveLinuxAppIconPng(struct wl_client* client,
   }
 
   std::string lower_app = ToLowerAscii(app_id);
+  std::string lower_app_short = lower_app;
+  if (size_t dot = lower_app_short.find_last_of('.'); dot != std::string::npos && dot + 1 < lower_app_short.size()) {
+    lower_app_short = lower_app_short.substr(dot + 1);
+  }
   std::string lower_title = ToLowerAscii(title);
   std::string lower_exe_base = ToLowerAscii(exe_basename);
 
@@ -456,10 +460,14 @@ std::vector<uint8_t> ResolveLinuxAppIconPng(struct wl_client* client,
 
       int score = 0;
       if (!lower_app.empty()) {
-        if (id_low == lower_app || wm_low == lower_app) {
+        if (id_low == lower_app || wm_low == lower_app ||
+            (!lower_app_short.empty() && (id_low == lower_app_short || wm_low == lower_app_short))) {
           score = 100;
         } else if (id_low.find(lower_app) != std::string::npos ||
                    lower_app.find(id_low) != std::string::npos ||
+                   (!lower_app_short.empty() && lower_app_short.size() >= 3 &&
+                    (id_low.find(lower_app_short) != std::string::npos ||
+                     (!wm_low.empty() && wm_low.find(lower_app_short) != std::string::npos))) ||
                    (!wm_low.empty() && (wm_low.find(lower_app) != std::string::npos ||
                                         lower_app.find(wm_low) != std::string::npos))) {
           score = std::max(score, 80);
@@ -492,6 +500,9 @@ std::vector<uint8_t> ResolveLinuxAppIconPng(struct wl_client* client,
   // Step 2: Direct freedesktop Icon Theme lookup using app_id or executable basename
   if (png_bytes.empty() && !lower_app.empty()) {
     ResolveIconValueToPng(lower_app, &png_bytes);
+  }
+  if (png_bytes.empty() && !lower_app_short.empty() && lower_app_short != lower_app) {
+    ResolveIconValueToPng(lower_app_short, &png_bytes);
   }
   if (png_bytes.empty() && !lower_exe_base.empty()) {
     ResolveIconValueToPng(lower_exe_base, &png_bytes);
