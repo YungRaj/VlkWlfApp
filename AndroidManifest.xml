@@ -28,6 +28,12 @@
             android:supportsPictureInPicture="true"
             android:exported="true"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|colorMode|locale|mcc|mnc|touchscreen">
+            <layout
+                android:defaultWidth="1400dp"
+                android:defaultHeight="900dp"
+                android:gravity="top|start"
+                android:minWidth="480dp"
+                android:minHeight="360dp" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -45,6 +51,12 @@
             android:supportsPictureInPicture="true"
             android:exported="true"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|colorMode|locale|mcc|mnc|touchscreen">
+            <layout
+                android:defaultWidth="1400dp"
+                android:defaultHeight="900dp"
+                android:gravity="top|start"
+                android:minWidth="480dp"
+                android:minHeight="360dp" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -62,6 +74,12 @@
             android:supportsPictureInPicture="true"
             android:exported="true"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|colorMode|locale|mcc|mnc|touchscreen">
+            <layout
+                android:defaultWidth="1400dp"
+                android:defaultHeight="900dp"
+                android:gravity="top|start"
+                android:minWidth="480dp"
+                android:minHeight="360dp" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -78,7 +96,18 @@
             android:resizeableActivity="true"
             android:supportsPictureInPicture="true"
             android:exported="true"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|colorMode|locale|mcc|mnc|touchscreen" />
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|colorMode|locale|mcc|mnc|touchscreen">
+            <layout
+                android:defaultWidth="1400dp"
+                android:defaultHeight="900dp"
+                android:gravity="top|start"
+                android:minWidth="480dp"
+                android:minHeight="360dp" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
 
         <activity
             android:name=".GimpWaylandActivity"
@@ -91,6 +120,12 @@
             android:supportsPictureInPicture="true"
             android:exported="true"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|colorMode|locale|mcc|mnc|touchscreen">
+            <layout
+                android:defaultWidth="1400dp"
+                android:defaultHeight="900dp"
+                android:gravity="top|start"
+                android:minWidth="480dp"
+                android:minHeight="360dp" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -107,7 +142,14 @@
             android:resizeableActivity="true"
             android:supportsPictureInPicture="true"
             android:exported="true"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|colorMode|locale|mcc|mnc|touchscreen" />
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|colorMode|locale|mcc|mnc|touchscreen">
+            <layout
+                android:defaultWidth="1400dp"
+                android:defaultHeight="900dp"
+                android:gravity="top|start"
+                android:minWidth="480dp"
+                android:minHeight="360dp" />
+        </activity>
 
         <activity
             android:name=".GenericWaylandActivity2"
@@ -119,6 +161,13 @@
             android:resizeableActivity="true"
             android:supportsPictureInPicture="true"
             android:exported="true"
-            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|colorMode|locale|mcc|mnc|touchscreen" />
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|layoutDirection|colorMode|locale|mcc|mnc|touchscreen">
+            <layout
+                android:defaultWidth="1400dp"
+                android:defaultHeight="900dp"
+                android:gravity="top|start"
+                android:minWidth="480dp"
+                android:minHeight="360dp" />
+        </activity>
     </application>
 </manifest>

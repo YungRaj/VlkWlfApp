@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# vkwlf-launch-app — Smart Linux application launcher for VkWlfApp.
+#
+# Handles:
+#   - Auto-discovering .desktop files across /usr/share/applications, ~/.local/share/applications,
+#     Flatpak, and Snap directories
+#   - Smart per-app environment & flags:
+#       * Firefox: MOZ_ENABLE_WAYLAND=1
+#       * Electron / VS Code / Antigravity / Chromium / Chrome:
+#         --ozone-platform=wayland --enable-features=UseOzonePlatform --ignore-gpu-blocklist
+#       * GTK / Qt: GDK_BACKEND=wayland QT_QPA_PLATFORM="wayland;xcb"
+#       * X11-only apps (e.g. TeamViewer): automatic Xwayland :15 fallback
+#   - Optional 1-click apt installation (--install) if a requested package is not yet installed
+set -u
+
+RT="/tmp/vkwlf-xdg-$(id -u)"
+mkdir -p "$RT"
+chmod 700 "$RT"
+SOCK="$RT/wayland-0"
+XDISP=":15"
+DO_INSTALL=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --socket)
+      SOCK="$2"
+      RT="$(dirname "$SOCK")"
+      shift 2
+      ;;
+    --install)
+      DO_INSTALL=1
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+SPEC="${1:-}"
+[[ -n "$SPEC" ]] || exit 0
+
+WAYLAND_NAME="$(basename "$SOCK")"
+export XDG_RUNTIME_DIR="$RT"
+export WAYLAND_DISPLAY="$WAYLAND_NAME"
+export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/gfxstream_vk_icd.json:/usr/share/vulkan/icd.d/lvp_icd.json"
+export VK_DRIVER_FILES="/usr/share/vulkan/icd.d/gfxstream_vk_icd.json:/usr/share/vulkan/icd.d/lvp_icd.json"
+if sudo -n dmesg 2>/dev/null | grep -q "number of cap sets: [1-9]"; then
+  export MESA_LOADER_DRIVER_OVERRIDE=zink
+  unset LIBGL_ALWAYS_SOFTWARE
+else
+  unset MESA_LOADER_DRIVER_OVERRIDE
+  unset LIBGL_ALWAYS_SOFTWARE
+fi
+
+# Strip desktop field codes (%f, %F, %u, %U, %i, %c, %k) from an Exec= string
+strip_exec_codes() {
+  local s="$1"
+  echo "$s" | sed -E 's/[[:space:]]+%[fFuUdDnNickvm]//g; s/^"(.*)"$/\1/'
+}
+
+# Resolve a .desktop file by ID or fuzzy name
+find_desktop_file() {
+  local query="$1"
+  local low_q="${query,,}"
+  low_q="${low_q%.desktop}"
+  local dirs=(
+    "$HOME/.local/share/applications"
+    "/usr/local/share/applications"
+    "/usr/share/applications"
+    "/var/lib/flatpak/exports/share/applications"
+    "/var/lib/snapd/desktop/applications"
+  )
+  for d in "${dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    for f in "$d"/*.desktop; do
+      [[ -f "$f" ]] || continue
+      local base="$(basename "$f" .desktop)"
+      if [[ "${base,,}" == "$low_q" ]]; then
+        echo "$f"
+        return 0
+      fi
+    done
+  done
+  for d in "${dirs[@]}"; do
+    [[ -d "$d" ]] || continue
+    for f in "$d"/*.desktop; do
+      [[ -f "$f" ]] || continue
+      local base="$(basename "$f" .desktop)"
+      if [[ "${base,,}" == *"$low_q"* ]]; then
+        echo "$f"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+install_package_if_needed() {
+  local pkg="$1"
+  [[ -n "$pkg" ]] || return 1
+  echo "[vkwlf-launch-app] Installing package '$pkg' via apt..."
+  export DEBIAN_FRONTEND=noninteractive
+  sudo -n apt-get update -y >/tmp/vkwlf-apt.log 2>&1 || true
+  sudo -n apt-get install -y "$pkg" >>/tmp/vkwlf-apt.log 2>&1 || return 1
+  return 0
+}
+
+LOW_SPEC="${SPEC,,}"
+LOW_SPEC="${LOW_SPEC%.desktop}"
+
+# Map canonical names to apt package names if --install was requested or binary is missing
+APT_PKG=""
+case "$LOW_SPEC" in
+  *firefox*)     APT_PKG="firefox-esr" ;;
+  *gimp*)        APT_PKG="gimp" ;;
+  *vscode*|*code*) APT_PKG="code" ;;
+  *chromium*)    APT_PKG="chromium" ;;
+  *vlc*)         APT_PKG="vlc" ;;
+  *libreoffice*) APT_PKG="libreoffice" ;;
+  *foot*)        APT_PKG="foot" ;;
+  *weston*)      APT_PKG="weston" ;;
+  *nautilus*)    APT_PKG="nautilus" ;;
+  *inkscape*)    APT_PKG="inkscape" ;;
+  *)             APT_PKG="$SPEC" ;;
+esac
+
+if [[ "$DO_INSTALL" -eq 1 ]]; then
+  install_package_if_needed "$APT_PKG" || true
+fi
+
+# 1. Special handling for known apps that require specific flags or Xwayland display
+if [[ "$LOW_SPEC" == *"antigravity"* ]]; then
+  if pgrep -x antigravity >/dev/null 2>&1; then
+    exit 0
+  fi
+  unset DISPLAY
+  export GDK_BACKEND=wayland QT_QPA_PLATFORM=wayland ELECTRON_OZONE_PLATFORM_HINT=wayland NODE_TLS_REJECT_UNAUTHORIZED=0
+  nohup /usr/share/antigravity/antigravity \
+    --ozone-platform=wayland \
+    --enable-features=UseOzonePlatform \
+    --ignore-gpu-blocklist \
+    --ignore-certificate-errors \
+    --user-data-dir="$HOME/.config/Antigravity-vkwlf" \
+    "$HOME/VlkWlfApp" > "$RT/antigravity.log" 2>&1 &
+  exit 0
+fi
+
+if [[ "$LOW_SPEC" == *"teamviewer"* ]]; then
+  if pgrep -x TeamViewer >/dev/null 2>&1; then
+    exit 0
+  fi
+  if ! pgrep -f "Xwayland $XDISP" >/dev/null 2>&1; then
+    rm -f /tmp/.X15-lock /tmp/.X11-unix/X15
+    XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY="$WAYLAND_NAME" \
+      Xwayland "$XDISP" -shm -noreset -geometry 1280x720 > "$RT/xwayland15.log" 2>&1 &
+    for _ in $(seq 1 30); do
+      [[ -S /tmp/.X11-unix/X15 ]] && break
+      sleep 0.1
+    done
+    if [[ -f /usr/local/share/vkwlf/default.xkb ]]; then
+      xkbcomp /usr/local/share/vkwlf/default.xkb "$XDISP" >/dev/null 2>&1 || true
+    elif [[ -f "$HOME/VlkWlfApp/guest/default.xkb" ]]; then
+      xkbcomp "$HOME/VlkWlfApp/guest/default.xkb" "$XDISP" >/dev/null 2>&1 || true
+    fi
+  fi
+  TV_SESSION_ID="$(loginctl list-sessions --no-legend 2>/dev/null | awk '/tty1/ {print $1; exit}')"
+  [[ -z "$TV_SESSION_ID" ]] && TV_SESSION_ID="1"
+  XDG_RUNTIME_DIR="/run/user/$(id -u)" WAYLAND_DISPLAY="$WAYLAND_NAME" XDG_SESSION_ID="$TV_SESSION_ID" \
+    QT_QPA_PLATFORM=xcb DISPLAY="$XDISP" \
+    nohup /opt/teamviewer/tv_bin/TeamViewer > "$RT/teamviewer.log" 2>&1 &
+  exit 0
+fi
+
+if [[ "$LOW_SPEC" == *"firefox"* ]]; then
+  if ! command -v firefox-esr >/dev/null 2>&1 && ! command -v firefox >/dev/null 2>&1; then
+    install_package_if_needed "firefox-esr" || true
+  fi
+  FF_BIN="$(command -v firefox-esr || command -v firefox || echo /usr/lib/firefox-esr/firefox-esr)"
+  unset DISPLAY
+  export MOZ_ENABLE_WAYLAND=1 GDK_BACKEND=wayland
+  nohup "$FF_BIN" > "$RT/firefox.log" 2>&1 &
+  exit 0
+fi
+
+if [[ "$LOW_SPEC" == *"vscode"* || "$LOW_SPEC" == "code" || "$LOW_SPEC" == "com.microsoft.vscode" ]]; then
+  if [[ ! -x /usr/share/code/code ]] && ! command -v code >/dev/null 2>&1; then
+    if [[ -f "$HOME/code_1.141.0-1791276758_amd64.deb" ]]; then
+      sudo -n dpkg -i "$HOME/code_1.141.0-1791276758_amd64.deb" >/tmp/vkwlf-apt.log 2>&1 || true
+    else
+      install_package_if_needed "code" || true
+    fi
+  fi
+  CODE_BIN="/usr/share/code/code"
+  [[ -x "$CODE_BIN" ]] || CODE_BIN="$(command -v code || echo /usr/share/code/code)"
+  unset DISPLAY
+  export GDK_BACKEND=wayland QT_QPA_PLATFORM=wayland ELECTRON_OZONE_PLATFORM_HINT=wayland
+  nohup "$CODE_BIN" --no-sandbox \
+    --ozone-platform=wayland \
+    --enable-features=UseOzonePlatform \
+    --ignore-gpu-blocklist \
+    --user-data-dir="$HOME/.config/Code-vkwlf" > "$RT/vscode.log" 2>&1 &
+  exit 0
+fi
+
+if [[ "$LOW_SPEC" == *"gimp"* ]]; then
+  if ! command -v gimp >/dev/null 2>&1 && ! command -v gimp-3.0 >/dev/null 2>&1; then
+    install_package_if_needed "gimp" || true
+  fi
+  GIMP_BIN="$(command -v gimp || command -v gimp-3.0 || echo gimp)"
+  unset DISPLAY
+  export GDK_BACKEND=wayland
+  nohup "$GIMP_BIN" > "$RT/gimp.log" 2>&1 &
+  exit 0
+fi
+
+# 2. General .desktop file resolution or custom command execution
+EXEC_CMD=""
+DESKTOP_FILE="$(find_desktop_file "$SPEC" || true)"
+if [[ -n "$DESKTOP_FILE" && -f "$DESKTOP_FILE" ]]; then
+  RAW_EXEC="$(awk -F= '/^\[Desktop Entry\]/{in_de=1; next} /^\[/{in_de=0} in_de && /^Exec=/{sub(/^Exec=/, ""); print; exit}' "$DESKTOP_FILE")"
+  EXEC_CMD="$(strip_exec_codes "$RAW_EXEC")"
+fi
+
+if [[ -z "$EXEC_CMD" ]]; then
+  EXEC_CMD="$(strip_exec_codes "$SPEC")"
+fi
+
+FIRST_BIN="${EXEC_CMD%% *}"
+if ! command -v "$FIRST_BIN" >/dev/null 2>&1 && [[ ! -x "$FIRST_BIN" ]]; then
+  install_package_if_needed "$APT_PKG" || true
+  DESKTOP_FILE="$(find_desktop_file "$SPEC" || true)"
+  if [[ -n "$DESKTOP_FILE" && -f "$DESKTOP_FILE" ]]; then
+    RAW_EXEC="$(awk -F= '/^\[Desktop Entry\]/{in_de=1; next} /^\[/{in_de=0} in_de && /^Exec=/{sub(/^Exec=/, ""); print; exit}' "$DESKTOP_FILE")"
+    EXEC_CMD="$(strip_exec_codes "$RAW_EXEC")"
+  fi
+fi
+
+# Provide both Wayland (primary) and Xwayland :15 (fallback for X11-only apps)
+if [[ -S /tmp/.X11-unix/X15 ]]; then
+  export DISPLAY="$XDISP"
+else
+  unset DISPLAY
+fi
+
+export GDK_BACKEND="wayland,x11"
+export QT_QPA_PLATFORM="wayland;xcb"
+export MOZ_ENABLE_WAYLAND=1
+export ELECTRON_OZONE_PLATFORM_HINT=wayland
+export SDL_VIDEODRIVER=wayland
+
+# Add Wayland Ozone flags automatically for Chromium/Electron-based browsers
+if [[ "$EXEC_CMD" == *"chromium"* || "$EXEC_CMD" == *"google-chrome"* || "$EXEC_CMD" == *"brave"* ]]; then
+  EXEC_CMD="$EXEC_CMD --no-sandbox --ozone-platform=wayland --enable-features=UseOzonePlatform --ignore-gpu-blocklist"
+fi
+
+SAFE_LOG_NAME="$(echo "$LOW_SPEC" | tr -cd 'a-z0-9_-')"
+[[ -n "$SAFE_LOG_NAME" ]] || SAFE_LOG_NAME="custom"
+nohup bash -c "$EXEC_CMD" > "$RT/app-${SAFE_LOG_NAME}.log" 2>&1 &

@@ -58,6 +58,16 @@ struct CommittedFrame {
   std::vector<DmaBufPlane> planes;
 };
 
+struct GuestAppCatalogEntry {
+  std::string desktop_id;
+  std::string name;
+  std::string comment;
+  std::string exec;
+  std::string apt_package;
+  bool installed = true;
+  std::vector<uint8_t> icon_png;
+};
+
 class WaylandServerEngine {
  public:
   struct Config {
@@ -73,6 +83,7 @@ class WaylandServerEngine {
                                                  const std::string& title,
                                                  const std::string& app_id,
                                                  const std::vector<uint8_t>& icon_png)>;
+  using AppCatalogCallback = std::function<void(const std::vector<GuestAppCatalogEntry>& entries)>;
 
   explicit WaylandServerEngine(const Config& config);
   ~WaylandServerEngine();
@@ -92,6 +103,23 @@ class WaylandServerEngine {
   // Registers a callback invoked when a guest Wayland application (e.g. VS Code-class IDEs)
   // creates and commits a toplevel window, allowing the Android host to auto-foreground the UI.
   void SetAppLaunchedCallback(AppLaunchedCallback cb);
+
+  // Registers a callback invoked when the guest VM sends or updates its catalog of available Linux
+  // GUI applications (.desktop entries + installable candidates).
+  void SetAppCatalogCallback(AppCatalogCallback cb);
+
+  // Returns the latest cached catalog of guest Linux applications.
+  std::vector<GuestAppCatalogEntry> GetGuestAppCatalog() const;
+
+  // Requests the connected guest VM proxy to launch (or install & launch) a Linux application, or
+  // refresh the catalog ("__REFRESH_CATALOG__").
+  void RequestGuestAppLaunch(const std::string& launch_spec);
+
+  // Discovers installed .desktop entries + curated installable Linux GUI apps on the local (guest)
+  // system and serializes/sends the catalog over a bridge socket to the Android host.
+  static std::vector<GuestAppCatalogEntry> DiscoverLocalGuestAppCatalog();
+  static bool SendAppCatalogOverBridgeSocket(int sock_fd,
+                                             const std::vector<GuestAppCatalogEntry>& entries);
 
   // Thread-safe frame queue operations for the Vulkan renderer thread.
   void PushCommittedFrame(CommittedFrame&& frame);
@@ -166,6 +194,7 @@ class WaylandServerEngine {
                          const std::string& title,
                          const std::string& app_id,
                          const std::vector<uint8_t>& icon_png);
+  void NotifyAppCatalogUpdated(std::vector<GuestAppCatalogEntry>&& entries);
 
  private:
   struct InputCommand {
@@ -178,6 +207,7 @@ class WaylandServerEngine {
       kDisplayResize = 6,
       kQuit = 7,
       kFocusSurface = 8,
+      kLaunchApp = 9,
     };
     Type type;
     uint32_t time_ms = 0;
@@ -192,6 +222,7 @@ class WaylandServerEngine {
     uint32_t target_surface_id = 0;
     uint32_t host_width = 0;
     uint32_t host_height = 0;
+    std::string launch_spec;
   };
 
   struct ToplevelEntry {
@@ -235,6 +266,10 @@ class WaylandServerEngine {
 
   std::mutex app_cb_mutex_;
   AppLaunchedCallback app_launched_cb_;
+  AppCatalogCallback app_catalog_cb_;
+
+  mutable std::mutex app_catalog_mutex_;
+  std::vector<GuestAppCatalogEntry> guest_app_catalog_;
 
   std::thread server_thread_;
   std::atomic<bool> running_{false};

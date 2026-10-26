@@ -340,6 +340,9 @@ int main(int argc, char** argv) {
         continue;
       }
 
+      auto catalog = vkwlf::WaylandServerEngine::DiscoverLocalGuestAppCatalog();
+      vkwlf::WaylandServerEngine::SendAppCatalogOverBridgeSocket(host_fd, catalog);
+
       for (const auto& [sid, cached_frame] : last_toplevel_frames) {
         (void)sid;
         if (!cached_frame.is_subsurface) {

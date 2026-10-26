@@ -3,10 +3,13 @@ package com.google.example.vkwlf;
 import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.ActivityOptions;
+import android.app.AlertDialog;
 import android.content.Intent;
 import android.content.om.FabricatedOverlay;
 import android.content.om.OverlayManager;
 import android.content.om.OverlayManagerTransaction;
+import android.content.pm.ShortcutInfo;
+import android.content.pm.ShortcutManager;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -17,11 +20,14 @@ import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.Icon;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.system.Os;
+import android.text.Editable;
 import android.text.TextUtils;
+import android.text.TextWatcher;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -34,14 +40,18 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -79,6 +89,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static volatile int[] sLastKnownSurfaceIds = null;
     private static volatile String[] sLastKnownTitles = null;
     private static volatile String[] sLastKnownAppIds = null;
+
+    static final class GuestCatalogApp {
+        final String desktopId;
+        final String name;
+        final String comment;
+        final String exec;
+        final String aptPackage;
+        final boolean installed;
+
+        GuestCatalogApp(
+                String desktopId,
+                String name,
+                String comment,
+                String exec,
+                String aptPackage,
+                boolean installed) {
+            this.desktopId = desktopId != null ? desktopId : "";
+            this.name = name != null ? name : "";
+            this.comment = comment != null ? comment : "";
+            this.exec = exec != null ? exec : "";
+            this.aptPackage = aptPackage != null ? aptPackage : "";
+            this.installed = installed;
+        }
+    }
+
+    private static volatile List<GuestCatalogApp> sGuestAppCatalog = Collections.emptyList();
+    private static final Map<String, Bitmap> sCatalogIconCache = new ConcurrentHashMap<>();
+    private static volatile String sPendingAutoSwitchAppLabel = null;
+    private static volatile long sPendingAutoSwitchExpireMs = 0L;
+    private AlertDialog mActiveLauncherDialog = null;
+    private LinearLayout mActiveLauncherListContainer = null;
+    private String mActiveLauncherFilter = "";
 
     static {
         System.loadLibrary("vkwlf_jni");
@@ -736,6 +778,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return targetSid;
     }
 
+    private static Rect findBestExistingWindowBounds(MainActivity self) {
+        for (MainActivity act : sActiveSlotActivities.values()) {
+            if (act != null
+                    && act != self
+                    && act != sPendingFinishActivity
+                    && !act.isFinishing()
+                    && !act.isDestroyed()) {
+                try {
+                    Rect b = act.getWindowManager().getCurrentWindowMetrics().getBounds();
+                    if (b != null && b.width() >= 900 && b.height() >= 600) {
+                        return b;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
     @SuppressWarnings("deprecation")
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -753,6 +814,56 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             Thread cleanupThread = new Thread(this::cleanupStaleDynamicOverlays, "VkWlfOverlayCleanup");
             cleanupThread.setDaemon(true);
             cleanupThread.start();
+        }
+
+        // If launched directly from the GoogleBook OS search bar or launcher (without explicit
+        // launchBounds), ensure the freeform window expands to match the full desktop window size
+        // instead of opening at a small default freeform size.
+        if (savedInstanceState == null
+                && launchIntent != null
+                && !launchIntent.getBooleanExtra("bounds_configured", false)
+                && resolveIntentTargetSurface(launchIntent) <= 0) {
+            try {
+                Rect curBounds = getWindowManager().getCurrentWindowMetrics().getBounds();
+                Rect maxBounds = getWindowManager().getMaximumWindowMetrics().getBounds();
+                Rect existingBounds = findBestExistingWindowBounds(this);
+                Rect targetBounds = null;
+                if (existingBounds != null) {
+                    targetBounds = new Rect(existingBounds);
+                } else if (maxBounds != null && !maxBounds.isEmpty()) {
+                    float dp = getResources().getDisplayMetrics().density;
+                    int marginX = (int) (32 * dp);
+                    int marginTop = (int) (32 * dp);
+                    int marginBottom = (int) (72 * dp);
+                    targetBounds =
+                            new Rect(
+                                    maxBounds.left + marginX,
+                                    maxBounds.top + marginTop,
+                                    maxBounds.right - marginX,
+                                    maxBounds.bottom - marginBottom);
+                }
+                if (targetBounds != null
+                        && curBounds != null
+                        && (curBounds.width() < (targetBounds.width() * 4) / 5
+                                || curBounds.height() < (targetBounds.height() * 4) / 5)) {
+                    Intent relaunch = new Intent(launchIntent);
+                    relaunch.setComponent(getComponentName());
+                    relaunch.putExtra("bounds_configured", true);
+                    relaunch.addFlags(
+                            Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
+                    ActivityOptions ao = ActivityOptions.makeCustomAnimation(this, 0, 0);
+                    ao.setLaunchBounds(targetBounds);
+                    sActiveSlotActivities.remove(mWindowSlot, this);
+                    nativeReleaseWindowSlot(mWindowSlot);
+                    mWindowSlot = -1;
+                    startActivity(relaunch, ao.toBundle());
+                    finish();
+                    overridePendingTransition(0, 0);
+                    return;
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "Failed to expand initial freeform window bounds", t);
+            }
         }
 
         final int slot = mWindowSlot;
@@ -880,7 +991,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     cachedTitles,
                     cachedAppIds,
                     mBoundSurfaceId > 0 ? mBoundSurfaceId : initialTargetSid);
+        } else {
+            populateAppSwitcherBarUi(new int[0], new String[0], new String[0], initialTargetSid);
         }
+        autoLaunchSlotAppIfNeeded(getIntent());
     }
 
     @Override
@@ -890,6 +1004,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 intent != null && intent.getBooleanExtra("is_background_recycle", false);
         setIntent(intent);
         handleIntentTargetSurface(intent);
+        autoLaunchSlotAppIfNeeded(intent);
         markAsForegroundTaskForDock();
     }
 
@@ -928,7 +1043,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (sPendingFinishActivity == this) {
             sPendingFinishActivity = null;
         }
-        sActiveSlotActivities.remove(mWindowSlot, this);
+        if (mWindowSlot >= 0) {
+            sActiveSlotActivities.remove(mWindowSlot, this);
+        }
         if (mBoundSurfaceId > 0) {
             boolean stillBoundElsewhere = false;
             for (MainActivity act : sActiveSlotActivities.values()) {
@@ -951,7 +1068,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (sActiveSlotActivities.isEmpty()) {
             clearAllAppTasksExcludeFromRecents();
         }
-        nativeReleaseWindowSlot(mWindowSlot);
+        if (mWindowSlot >= 0) {
+            nativeReleaseWindowSlot(mWindowSlot);
+        }
         super.onDestroy();
     }
 
@@ -961,6 +1080,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             mBoundSurfaceId = targetSid;
             sActiveWindowSurfaceIds.add(targetSid);
             nativeSelectSurfaceForSlot(mWindowSlot, targetSid);
+            if (mSurfaceView != null
+                    && mSurfaceView.getWidth() > 0
+                    && mSurfaceView.getHeight() > 0) {
+                nativeOnSurfaceChangedForSlot(
+                        mWindowSlot, mSurfaceView.getWidth(), mSurfaceView.getHeight());
+            }
         }
     }
 
@@ -1115,12 +1240,34 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         sLastKnownSurfaceIds = surfaceIds;
         sLastKnownTitles = titles;
         sLastKnownAppIds = appIds;
+        int autoSwitchSid = 0;
+        String autoSwitchLabel = null;
+        String pendingLabel = sPendingAutoSwitchAppLabel;
+        boolean pendingValid =
+                pendingLabel != null && System.currentTimeMillis() < sPendingAutoSwitchExpireMs;
         for (int i = 0; i < surfaceIds.length; i++) {
             String t = i < titles.length ? titles[i] : "";
             String a = i < appIds.length ? appIds[i] : "";
-            sSurfaceAppLabels.put(surfaceIds[i], deriveAppLabel(t, a));
+            String lbl = deriveAppLabel(t, a);
+            sSurfaceAppLabels.put(surfaceIds[i], lbl);
+            if (pendingValid
+                    && (lbl.equalsIgnoreCase(pendingLabel)
+                            || t.toLowerCase().contains(pendingLabel.toLowerCase())
+                            || a.toLowerCase().contains(pendingLabel.toLowerCase()))) {
+                autoSwitchSid = surfaceIds[i];
+                autoSwitchLabel = lbl;
+            }
         }
-        runOnUiThread(() -> populateAppSwitcherBarUi(surfaceIds, titles, appIds, boundSurfaceId));
+        final int finalAutoSid = autoSwitchSid;
+        final String finalAutoLbl = autoSwitchLabel;
+        runOnUiThread(() -> {
+            populateAppSwitcherBarUi(surfaceIds, titles, appIds, boundSurfaceId);
+            if (finalAutoSid > 0 && this == sDesiredForegroundActivity) {
+                sPendingAutoSwitchAppLabel = null;
+                sPendingAutoSwitchExpireMs = 0L;
+                switchToWaylandSurface(finalAutoSid, finalAutoLbl);
+            }
+        });
     }
 
     private void populateAppSwitcherBarUi(
@@ -1230,8 +1377,34 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 }
                 return false;
             });
-            mAppSwitcherBar.addView(popBtn);
+            LinearLayout.LayoutParams popLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            popLp.setMarginEnd((int) (8 * dp));
+            mAppSwitcherBar.addView(popBtn, popLp);
         }
+
+        TextView launchBtn = new TextView(this);
+        launchBtn.setText("＋ Launch App");
+        launchBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        launchBtn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        launchBtn.setTextColor(night ? 0xFFA8DAB5 : 0xFF137333);
+        launchBtn.setClickable(true);
+        launchBtn.setFocusable(false);
+        launchBtn.setPadding((int) (12 * dp), (int) (5 * dp), (int) (12 * dp), (int) (5 * dp));
+        GradientDrawable launchBg = new GradientDrawable();
+        launchBg.setCornerRadius(14 * dp);
+        launchBg.setColor(night ? 0xFF1E3A28 : 0xFFE6F4EA);
+        launchBg.setStroke((int) (1 * dp), night ? 0xFF81C995 : 0xFF1E8E3E);
+        launchBtn.setBackground(launchBg);
+        launchBtn.setOnClickListener(v -> showAppLauncherDialog());
+        launchBtn.setOnTouchListener((v, ev) -> {
+            if (ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                showAppLauncherDialog();
+                return true;
+            }
+            return false;
+        });
+        mAppSwitcherBar.addView(launchBtn);
     }
 
     private void finishPendingActivityNow() {
@@ -1284,6 +1457,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (sid == mBoundSurfaceId && targetClass == getClass()) {
             markAsForegroundTaskForDock();
             nativeSelectSurfaceForSlot(mWindowSlot, sid);
+            if (mSurfaceView != null
+                    && mSurfaceView.getWidth() > 0
+                    && mSurfaceView.getHeight() > 0) {
+                nativeOnSurfaceChangedForSlot(
+                        mWindowSlot, mSurfaceView.getWidth(), mSurfaceView.getHeight());
+            }
             mSurfaceView.requestFocus();
             return;
         }
@@ -1358,6 +1537,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         sActiveWindowSurfaceIds.add(sid);
         markAsForegroundTaskForDock();
         nativeSelectSurfaceForSlot(mWindowSlot, sid);
+        if (mSurfaceView != null
+                && mSurfaceView.getWidth() > 0
+                && mSurfaceView.getHeight() > 0) {
+            nativeOnSurfaceChangedForSlot(
+                    mWindowSlot, mSurfaceView.getWidth(), mSurfaceView.getHeight());
+        }
         mSurfaceView.requestFocus();
         if (resolvedIcon != null) {
             mCurrentIconBitmap = resolvedIcon;
@@ -1494,6 +1679,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         runOnUiThread(() -> {
             if (surfaceId > 0 && (mBoundSurfaceId <= 0 || mBoundSurfaceId == surfaceId)) {
+                boolean wasUnbound = (mBoundSurfaceId != surfaceId);
                 mBoundSurfaceId = surfaceId;
                 sActiveWindowSurfaceIds.add(surfaceId);
                 Class<? extends MainActivity> expectedClass =
@@ -1507,6 +1693,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         && findOpenActivityByClass(expectedClass) == null) {
                     switchToWaylandSurface(surfaceId, shortLabel);
                     return;
+                }
+                if (wasUnbound && mSurfaceView != null) {
+                    int sw = mSurfaceView.getWidth();
+                    int sh = mSurfaceView.getHeight();
+                    if (sw > 0 && sh > 0) {
+                        nativeOnSurfaceChangedForSlot(mWindowSlot, sw, sh);
+                    }
                 }
             }
             boolean labelChanged = !shortLabel.equals(getTitle());
@@ -1545,6 +1738,489 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 mLastAppId = appIdCopy;
             }
         });
+    }
+
+    private int findRunningSurfaceIdForApp(String query) {
+        if (query == null || query.isEmpty()) return 0;
+        String low = query.toLowerCase().replace(".desktop", "");
+        int[] sids = sLastKnownSurfaceIds;
+        String[] titles = sLastKnownTitles;
+        String[] appIds = sLastKnownAppIds;
+        if (sids == null || titles == null || appIds == null) return 0;
+        for (int i = 0; i < sids.length; i++) {
+            String t = (i < titles.length && titles[i] != null) ? titles[i].toLowerCase() : "";
+            String a = (i < appIds.length && appIds[i] != null) ? appIds[i].toLowerCase() : "";
+            String lbl = deriveAppLabel(t, a).toLowerCase();
+            if (t.contains(low)
+                    || a.contains(low)
+                    || lbl.contains(low)
+                    || low.contains(lbl)) {
+                return sids[i];
+            }
+        }
+        return 0;
+    }
+
+    private void autoLaunchSlotAppIfNeeded(Intent intent) {
+        String explicitSpec =
+                intent != null ? intent.getStringExtra("launch_guest_app") : null;
+        if (explicitSpec != null && !explicitSpec.trim().isEmpty()) {
+            intent.removeExtra("launch_guest_app");
+            int existingSid = findRunningSurfaceIdForApp(explicitSpec);
+            if (existingSid > 0) {
+                switchToWaylandSurface(existingSid, deriveAppLabel(explicitSpec, explicitSpec));
+            } else {
+                String lbl = deriveAppLabel(explicitSpec, explicitSpec);
+                sPendingAutoSwitchAppLabel = lbl;
+                sPendingAutoSwitchExpireMs = System.currentTimeMillis() + 25000L;
+                Toast.makeText(
+                                this,
+                                "Launching " + lbl + "…",
+                                Toast.LENGTH_SHORT)
+                        .show();
+                nativeLaunchGuestApp(explicitSpec.trim());
+            }
+            return;
+        }
+        int targetSid = resolveIntentTargetSurface(intent);
+        if (targetSid > 0) return;
+
+        int prefSlot = getPreferredWindowSlot();
+        String slotSpec = null;
+        String slotLabel = null;
+        if (prefSlot == 1) {
+            slotSpec = "com.teamviewer.TeamViewer";
+            slotLabel = "TeamViewer";
+        } else if (prefSlot == 2) {
+            slotSpec = "firefox-esr";
+            slotLabel = "Firefox";
+        } else if (prefSlot == 3) {
+            slotSpec = "com.microsoft.VSCode";
+            slotLabel = "VS Code";
+        } else if (prefSlot == 6) {
+            slotSpec = "gimp";
+            slotLabel = "GIMP";
+        }
+        if (slotSpec != null) {
+            int runningSid = findRunningSurfaceIdForApp(slotLabel);
+            if (runningSid > 0) {
+                if (mBoundSurfaceId != runningSid) {
+                    mBoundSurfaceId = runningSid;
+                    sActiveWindowSurfaceIds.add(runningSid);
+                    nativeSelectSurfaceForSlot(mWindowSlot, runningSid);
+                    if (mSurfaceView != null
+                            && mSurfaceView.getWidth() > 0
+                            && mSurfaceView.getHeight() > 0) {
+                        nativeOnSurfaceChangedForSlot(
+                                mWindowSlot, mSurfaceView.getWidth(), mSurfaceView.getHeight());
+                    }
+                }
+            } else {
+                sPendingAutoSwitchAppLabel = slotLabel;
+                sPendingAutoSwitchExpireMs = System.currentTimeMillis() + 25000L;
+                Toast.makeText(this, "Starting " + slotLabel + " in Linux VM…", Toast.LENGTH_SHORT)
+                        .show();
+                nativeLaunchGuestApp(slotSpec);
+            }
+        }
+    }
+
+    private Bitmap getCatalogIconBitmap(GuestCatalogApp app) {
+        if (app == null) return generateMonogramIconBitmap("W");
+        Bitmap cached = sCatalogIconCache.get(app.desktopId);
+        if (cached != null) return cached;
+        try {
+            byte[] png = nativeGetCatalogIconPng(app.desktopId);
+            if (png != null && png.length > 0) {
+                Bitmap decoded = BitmapFactory.decodeByteArray(png, 0, png.length);
+                if (decoded != null) {
+                    sCatalogIconCache.put(app.desktopId, decoded);
+                    sLabelIconCache.put(deriveAppLabel(app.name, app.desktopId), decoded);
+                    return decoded;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return getSurfaceIconBitmap(0, app.name, app.desktopId);
+    }
+
+    private List<GuestCatalogApp> getEffectiveAppCatalog() {
+        List<GuestCatalogApp> list = sGuestAppCatalog;
+        if (list != null && !list.isEmpty()) {
+            return list;
+        }
+        List<GuestCatalogApp> fallback = new ArrayList<>();
+        fallback.add(new GuestCatalogApp(
+                "antigravity", "Antigravity", "Antigravity IDE (Wayland)",
+                "/usr/share/antigravity/antigravity", "antigravity", true));
+        fallback.add(new GuestCatalogApp(
+                "firefox-esr", "Firefox ESR", "Mozilla Firefox Web Browser (Wayland)",
+                "firefox-esr", "firefox-esr", true));
+        fallback.add(new GuestCatalogApp(
+                "com.microsoft.VSCode", "Visual Studio Code", "Code Editing. Redefined.",
+                "/usr/share/code/code", "code", true));
+        fallback.add(new GuestCatalogApp(
+                "gimp", "GIMP", "GNU Image Manipulation Program",
+                "gimp", "gimp", true));
+        fallback.add(new GuestCatalogApp(
+                "com.teamviewer.TeamViewer", "TeamViewer", "Remote Control Solution (Xwayland)",
+                "/opt/teamviewer/tv_bin/TeamViewer", "teamviewer", true));
+        fallback.add(new GuestCatalogApp(
+                "chromium", "Chromium", "Chromium Web Browser (Wayland)",
+                "chromium", "chromium", false));
+        fallback.add(new GuestCatalogApp(
+                "vlc", "VLC Media Player", "Multimedia Player & Streamer",
+                "vlc", "vlc", false));
+        fallback.add(new GuestCatalogApp(
+                "libreoffice", "LibreOffice", "Office Productivity Suite",
+                "libreoffice", "libreoffice", false));
+        fallback.add(new GuestCatalogApp(
+                "foot", "Foot Terminal", "Fast Wayland Terminal Emulator",
+                "foot", "foot", false));
+        return fallback;
+    }
+
+    /**
+     * Invoked from native JNI when the guest VM sends or updates its discovered catalog of
+     * installed .desktop applications and installable Linux GUI packages.
+     */
+    @SuppressWarnings("unused")
+    public void onGuestAppCatalogUpdated(
+            String[] desktopIds,
+            String[] names,
+            String[] comments,
+            String[] execs,
+            String[] aptPackages,
+            boolean[] installedFlags) {
+        if (desktopIds == null || names == null) return;
+        List<GuestCatalogApp> updated = new ArrayList<>(desktopIds.length);
+        for (int i = 0; i < desktopIds.length; i++) {
+            String id = desktopIds[i];
+            String n = i < names.length ? names[i] : id;
+            String c = (comments != null && i < comments.length) ? comments[i] : "";
+            String e = (execs != null && i < execs.length) ? execs[i] : "";
+            String a = (aptPackages != null && i < aptPackages.length) ? aptPackages[i] : "";
+            boolean inst = (installedFlags == null || i >= installedFlags.length || installedFlags[i]);
+            updated.add(new GuestCatalogApp(id, n, c, e, a, inst));
+        }
+        sGuestAppCatalog = Collections.unmodifiableList(updated);
+        runOnUiThread(() -> {
+            registerDynamicOsSearchShortcuts(updated);
+            if (mActiveLauncherDialog != null
+                    && mActiveLauncherDialog.isShowing()
+                    && mActiveLauncherListContainer != null) {
+                populateLauncherDialogList(mActiveLauncherListContainer, mActiveLauncherFilter);
+            }
+        });
+    }
+
+    private void registerDynamicOsSearchShortcuts(List<GuestCatalogApp> catalog) {
+        try {
+            ShortcutManager sm = getSystemService(ShortcutManager.class);
+            if (sm == null || catalog == null) return;
+            int maxShortcuts = Math.min(sm.getMaxShortcutCountPerActivity(), 8);
+            List<ShortcutInfo> shortcuts = new ArrayList<>();
+            for (GuestCatalogApp app : catalog) {
+                if (!app.installed) continue;
+                if (shortcuts.size() >= maxShortcuts) break;
+                String shortLabel = deriveAppLabel(app.name, app.desktopId);
+                Class<? extends MainActivity> targetCls =
+                        resolveActivityClassForSurface(0, app.name, app.desktopId);
+                Intent launchIntent = new Intent(Intent.ACTION_VIEW,
+                        Uri.parse("vkwlf://launch/" + app.desktopId), this, targetCls);
+                launchIntent.putExtra("launch_guest_app", app.desktopId);
+                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                Bitmap bmp = getCatalogIconBitmap(app);
+                ShortcutInfo.Builder b =
+                        new ShortcutInfo.Builder(this, "linux_app_" + app.desktopId)
+                                .setShortLabel(shortLabel)
+                                .setLongLabel("Launch " + app.name)
+                                .setIntent(launchIntent);
+                if (bmp != null) {
+                    b.setIcon(Icon.createWithBitmap(bmp));
+                }
+                shortcuts.add(b.build());
+            }
+            if (!shortcuts.isEmpty()) {
+                sm.setDynamicShortcuts(shortcuts);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Failed to publish dynamic OS search shortcuts", t);
+        }
+    }
+
+    private void triggerGuestAppLaunchOrSwitch(GuestCatalogApp app, boolean installFirst) {
+        if (app == null) return;
+        String shortLabel = deriveAppLabel(app.name, app.desktopId);
+        int runningSid = findRunningSurfaceIdForApp(shortLabel);
+        if (!installFirst && runningSid > 0) {
+            switchToWaylandSurface(runningSid, shortLabel);
+            return;
+        }
+        sPendingAutoSwitchAppLabel = shortLabel;
+        sPendingAutoSwitchExpireMs = System.currentTimeMillis() + (installFirst ? 60000L : 20000L);
+        String spec =
+                installFirst
+                        ? ("install:" + (!app.aptPackage.isEmpty() ? app.aptPackage : app.desktopId))
+                        : app.desktopId;
+        Toast.makeText(
+                        this,
+                        installFirst
+                                ? ("Installing & launching " + app.name + " in Linux VM…")
+                                : ("Launching " + app.name + "…"),
+                        Toast.LENGTH_SHORT)
+                .show();
+        nativeLaunchGuestApp(spec);
+    }
+
+    private void populateLauncherDialogList(LinearLayout listContainer, String filterQuery) {
+        if (listContainer == null) return;
+        listContainer.removeAllViews();
+        final float dp = getResources().getDisplayMetrics().density;
+        final boolean night = isNightMode();
+        final String q = (filterQuery != null) ? filterQuery.trim().toLowerCase() : "";
+
+        List<GuestCatalogApp> catalog = getEffectiveAppCatalog();
+        int shown = 0;
+        for (final GuestCatalogApp app : catalog) {
+            String searchable =
+                    (app.name + " " + app.desktopId + " " + app.comment + " " + app.exec)
+                            .toLowerCase();
+            if (!q.isEmpty() && !searchable.contains(q)) {
+                continue;
+            }
+            shown++;
+            final String shortLabel = deriveAppLabel(app.name, app.desktopId);
+            final int runningSid = findRunningSurfaceIdForApp(shortLabel);
+            final boolean isRunning = (runningSid > 0);
+
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding((int) (12 * dp), (int) (10 * dp), (int) (12 * dp), (int) (10 * dp));
+            GradientDrawable rowBg = new GradientDrawable();
+            rowBg.setCornerRadius(12 * dp);
+            rowBg.setColor(night ? 0xFF26262E : 0xFFFFFFFF);
+            rowBg.setStroke((int) (1 * dp), night ? 0xFF383844 : 0xFFE0E0E6);
+            row.setBackground(rowBg);
+
+            ImageView iconView = new ImageView(this);
+            Bitmap bmp = getCatalogIconBitmap(app);
+            if (bmp != null) {
+                iconView.setImageBitmap(bmp);
+            } else {
+                iconView.setImageResource(resolveFallbackIconRes(app.name, app.desktopId));
+            }
+            LinearLayout.LayoutParams iconLp =
+                    new LinearLayout.LayoutParams((int) (36 * dp), (int) (36 * dp));
+            iconLp.setMarginEnd((int) (12 * dp));
+            row.addView(iconView, iconLp);
+
+            LinearLayout textCol = new LinearLayout(this);
+            textCol.setOrientation(LinearLayout.VERTICAL);
+            TextView titleView = new TextView(this);
+            titleView.setText(app.name);
+            titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+            titleView.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            titleView.setTextColor(night ? 0xFFF1F1F5 : 0xFF1B1B1F);
+            textCol.addView(titleView);
+
+            String sub = !app.comment.isEmpty() ? app.comment : app.exec;
+            if (!sub.isEmpty()) {
+                TextView subView = new TextView(this);
+                subView.setText(sub);
+                subView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+                subView.setSingleLine(true);
+                subView.setEllipsize(TextUtils.TruncateAt.END);
+                subView.setTextColor(night ? 0xFF9E9EA8 : 0xFF5F6368);
+                textCol.addView(subView);
+            }
+            row.addView(textCol, new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
+
+            TextView actionBtn = new TextView(this);
+            actionBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            actionBtn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            actionBtn.setPadding((int) (14 * dp), (int) (7 * dp), (int) (14 * dp), (int) (7 * dp));
+            GradientDrawable btnBg = new GradientDrawable();
+            btnBg.setCornerRadius(16 * dp);
+            if (isRunning) {
+                actionBtn.setText("Switch Window");
+                actionBtn.setTextColor(0xFFFFFFFF);
+                btnBg.setColor(night ? 0xFF2E5BFF : 0xFF1A73E8);
+            } else if (app.installed) {
+                actionBtn.setText("Launch");
+                actionBtn.setTextColor(night ? 0xFFA8DAB5 : 0xFF137333);
+                btnBg.setColor(night ? 0xFF1E3A28 : 0xFFE6F4EA);
+                btnBg.setStroke((int) (1 * dp), night ? 0xFF81C995 : 0xFF1E8E3E);
+            } else {
+                actionBtn.setText("Install & Launch");
+                actionBtn.setTextColor(night ? 0xFFFDD663 : 0xFFB06000);
+                btnBg.setColor(night ? 0xFF3C2F14 : 0xFFFEF7E0);
+                btnBg.setStroke((int) (1 * dp), night ? 0xFFFDD663 : 0xFFE37400);
+            }
+            actionBtn.setBackground(btnBg);
+            row.addView(actionBtn);
+
+            View.OnClickListener clickAction = v -> {
+                if (mActiveLauncherDialog != null && mActiveLauncherDialog.isShowing()) {
+                    mActiveLauncherDialog.dismiss();
+                }
+                triggerGuestAppLaunchOrSwitch(app, !app.installed);
+            };
+            row.setClickable(true);
+            row.setOnClickListener(clickAction);
+            actionBtn.setOnClickListener(clickAction);
+
+            LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            rowLp.bottomMargin = (int) (8 * dp);
+            listContainer.addView(row, rowLp);
+        }
+
+        if (!q.isEmpty()) {
+            LinearLayout customRow = new LinearLayout(this);
+            customRow.setOrientation(LinearLayout.HORIZONTAL);
+            customRow.setGravity(Gravity.CENTER_VERTICAL);
+            customRow.setPadding(
+                    (int) (12 * dp), (int) (10 * dp), (int) (12 * dp), (int) (10 * dp));
+            GradientDrawable customBg = new GradientDrawable();
+            customBg.setCornerRadius(12 * dp);
+            customBg.setColor(night ? 0xFF202838 : 0xFFE8F0FE);
+            customBg.setStroke((int) (1 * dp), night ? 0xFF8AB4F8 : 0xFF1A73E8);
+            customRow.setBackground(customBg);
+
+            TextView customText = new TextView(this);
+            customText.setText("Run command or apt install: \"" + filterQuery.trim() + "\"");
+            customText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            customText.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            customText.setTextColor(night ? 0xFF8AB4F8 : 0xFF1A73E8);
+            customRow.addView(customText, new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f));
+
+            TextView runBtn = new TextView(this);
+            runBtn.setText(shown == 0 ? "Install / Run" : "Run Custom");
+            runBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            runBtn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+            runBtn.setTextColor(0xFFFFFFFF);
+            runBtn.setPadding((int) (12 * dp), (int) (6 * dp), (int) (12 * dp), (int) (6 * dp));
+            GradientDrawable runBg = new GradientDrawable();
+            runBg.setCornerRadius(14 * dp);
+            runBg.setColor(night ? 0xFF2E5BFF : 0xFF1A73E8);
+            runBtn.setBackground(runBg);
+            customRow.addView(runBtn);
+
+            View.OnClickListener runCustomClick = v -> {
+                String cmd = filterQuery.trim();
+                if (mActiveLauncherDialog != null && mActiveLauncherDialog.isShowing()) {
+                    mActiveLauncherDialog.dismiss();
+                }
+                sPendingAutoSwitchAppLabel = deriveAppLabel(cmd, cmd);
+                sPendingAutoSwitchExpireMs = System.currentTimeMillis() + 30000L;
+                Toast.makeText(this, "Launching '" + cmd + "' in Linux VM…", Toast.LENGTH_SHORT)
+                        .show();
+                nativeLaunchGuestApp(cmd);
+            };
+            customRow.setClickable(true);
+            customRow.setOnClickListener(runCustomClick);
+            runBtn.setOnClickListener(runCustomClick);
+            listContainer.addView(customRow);
+        }
+    }
+
+    private void showAppLauncherDialog() {
+        nativeRefreshGuestAppCatalog();
+        final float dp = getResources().getDisplayMetrics().density;
+        final boolean night = isNightMode();
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding((int) (18 * dp), (int) (16 * dp), (int) (18 * dp), (int) (14 * dp));
+        root.setBackgroundColor(night ? 0xFF1B1B20 : 0xFFF2F0F6);
+
+        TextView header = new TextView(this);
+        header.setText("Launch Linux Application");
+        header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        header.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        header.setTextColor(night ? 0xFFF1F1F5 : 0xFF1B1B1F);
+        root.addView(header);
+
+        TextView subHeader = new TextView(this);
+        subHeader.setText(
+                "Auto-discovered .desktop apps & apt packages (Wayland + Xwayland smart bridge)");
+        subHeader.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        subHeader.setTextColor(night ? 0xFF9E9EA8 : 0xFF5F6368);
+        LinearLayout.LayoutParams subLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        subLp.topMargin = (int) (2 * dp);
+        subLp.bottomMargin = (int) (12 * dp);
+        root.addView(subHeader, subLp);
+
+        EditText searchInput = new EditText(this);
+        searchInput.setHint("Search apps (e.g. Firefox, GIMP, VS Code) or type command…");
+        searchInput.setSingleLine(true);
+        searchInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        searchInput.setTextColor(night ? 0xFFF1F1F5 : 0xFF1B1B1F);
+        searchInput.setHintTextColor(night ? 0xFF7A7A85 : 0xFF80868B);
+        searchInput.setPadding(
+                (int) (14 * dp), (int) (10 * dp), (int) (14 * dp), (int) (10 * dp));
+        GradientDrawable searchBg = new GradientDrawable();
+        searchBg.setCornerRadius(12 * dp);
+        searchBg.setColor(night ? 0xFF282830 : 0xFFFFFFFF);
+        searchBg.setStroke((int) (1 * dp), night ? 0xFF444452 : 0xFFDADCE0);
+        searchInput.setBackground(searchBg);
+        LinearLayout.LayoutParams searchLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        searchLp.bottomMargin = (int) (12 * dp);
+        root.addView(searchInput, searchLp);
+
+        ScrollView scroll = new ScrollView(this);
+        LinearLayout listContainer = new LinearLayout(this);
+        listContainer.setOrientation(LinearLayout.VERTICAL);
+        scroll.addView(listContainer, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams scrollLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, (int) (340 * dp));
+        root.addView(scroll, scrollLp);
+
+        mActiveLauncherListContainer = listContainer;
+        mActiveLauncherFilter = "";
+        populateLauncherDialogList(listContainer, "");
+
+        searchInput.setOnKeyListener((v, keyCode, event) -> {
+            mActiveLauncherFilter =
+                    searchInput.getText() != null ? searchInput.getText().toString() : "";
+            populateLauncherDialogList(listContainer, mActiveLauncherFilter);
+            if (keyCode == KeyEvent.KEYCODE_ENTER
+                    && event.getAction() == KeyEvent.ACTION_DOWN
+                    && !mActiveLauncherFilter.trim().isEmpty()) {
+                String cmd = mActiveLauncherFilter.trim();
+                if (mActiveLauncherDialog != null && mActiveLauncherDialog.isShowing()) {
+                    mActiveLauncherDialog.dismiss();
+                }
+                sPendingAutoSwitchAppLabel = deriveAppLabel(cmd, cmd);
+                sPendingAutoSwitchExpireMs = System.currentTimeMillis() + 30000L;
+                Toast.makeText(this, "Launching '" + cmd + "' in Linux VM…", Toast.LENGTH_SHORT)
+                        .show();
+                nativeLaunchGuestApp(cmd);
+                return true;
+            }
+            return false;
+        });
+
+        AlertDialog dialog =
+                new AlertDialog.Builder(this)
+                        .setView(root)
+                        .setNegativeButton("Close", (d, w) -> d.dismiss())
+                        .create();
+        dialog.setOnDismissListener(d -> {
+            if (mActiveLauncherDialog == dialog) {
+                mActiveLauncherDialog = null;
+                mActiveLauncherListContainer = null;
+            }
+        });
+        mActiveLauncherDialog = dialog;
+        dialog.show();
     }
 
     @Override
@@ -1587,6 +2263,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     protected static native int nativeAllocateWindowSlot(int preferredSlot);
     protected static native void nativeReleaseWindowSlot(int slot);
     protected static native byte[] nativeGetSurfaceIconPng(int surfaceId);
+    protected static native byte[] nativeGetCatalogIconPng(String desktopId);
+    protected static native void nativeLaunchGuestApp(String launchSpec);
+    protected static native void nativeRefreshGuestAppCatalog();
     protected native void nativeOnSurfaceCreatedForSlot(
             int slot, Surface surface, int width, int height);
     protected static native void nativeOnSurfaceChangedForSlot(int slot, int width, int height);

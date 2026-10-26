@@ -400,6 +400,13 @@ void UpdateSlotAssignmentsAndNotify() {
   };
   std::vector<PendingReplay> pending_replays;
 
+  struct PendingResize {
+    uint32_t surface_id;
+    uint32_t width;
+    uint32_t height;
+  };
+  std::vector<PendingResize> pending_resizes;
+
   {
     std::lock_guard<std::mutex> lock(g_app.slots_mutex);
     std::set<uint32_t> claimed_sids;
@@ -451,6 +458,9 @@ void UpdateSlotAssignmentsAndNotify() {
           if (matches_slot && claimed_sids.find(app.surface_id) == claimed_sids.end()) {
             picked = app.surface_id;
             claimed_sids.insert(picked);
+            if (is_dedicated_secondary_slot || slot_id == 0) {
+              slot.user_pinned_surface = true;
+            }
             break;
           }
         }
@@ -477,6 +487,10 @@ void UpdateSlotAssignmentsAndNotify() {
           pending_replays.push_back(PendingReplay{slot.renderer, desired_sid});
         }
       }
+      if (sid_changed && desired_sid != 0 && slot.window != nullptr && slot.width > 0 &&
+          slot.height > 0) {
+        pending_resizes.push_back(PendingResize{desired_sid, slot.width, slot.height});
+      }
       for (const auto& app : base_apps) {
         if (app.surface_id == desired_sid) {
           notifications.push_back(PendingNotification{
@@ -484,6 +498,13 @@ void UpdateSlotAssignmentsAndNotify() {
           break;
         }
       }
+    }
+  }
+
+  if (g_app.server) {
+    for (const auto& pr : pending_resizes) {
+      g_app.server->SetActiveInputSurface(pr.surface_id, pr.width, pr.height);
+      g_app.server->SetDisplaySizeForSurface(pr.surface_id, pr.width, pr.height);
     }
   }
 
@@ -571,6 +592,94 @@ void NotifyExternalAppLaunchListener(uint32_t surface_id,
 #endif
 }
 
+void NotifyAllActivitiesGuestCatalog(const std::vector<vkwlf::GuestAppCatalogEntry>& entries) {
+#ifdef __ANDROID__
+  if (!g_app.jvm) return;
+  JNIEnv* env = nullptr;
+  bool attached = false;
+  if (g_app.jvm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+    if (g_app.jvm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+      attached = true;
+    }
+  }
+  if (!env) return;
+
+  jsize count = static_cast<jsize>(entries.size());
+  jclass str_cls = env->FindClass("java/lang/String");
+  jobjectArray j_ids = env->NewObjectArray(count, str_cls, env->NewStringUTF(""));
+  jobjectArray j_names = env->NewObjectArray(count, str_cls, env->NewStringUTF(""));
+  jobjectArray j_comments = env->NewObjectArray(count, str_cls, env->NewStringUTF(""));
+  jobjectArray j_execs = env->NewObjectArray(count, str_cls, env->NewStringUTF(""));
+  jobjectArray j_apts = env->NewObjectArray(count, str_cls, env->NewStringUTF(""));
+  jbooleanArray j_installed = env->NewBooleanArray(count);
+
+  std::vector<jboolean> inst_vals(entries.size());
+  for (size_t i = 0; i < entries.size(); ++i) {
+    inst_vals[i] = entries[i].installed ? JNI_TRUE : JNI_FALSE;
+    jstring jid = env->NewStringUTF(entries[i].desktop_id.c_str());
+    jstring jn = env->NewStringUTF(entries[i].name.c_str());
+    jstring jc = env->NewStringUTF(entries[i].comment.c_str());
+    jstring je = env->NewStringUTF(entries[i].exec.c_str());
+    jstring ja = env->NewStringUTF(entries[i].apt_package.c_str());
+    env->SetObjectArrayElement(j_ids, static_cast<jsize>(i), jid);
+    env->SetObjectArrayElement(j_names, static_cast<jsize>(i), jn);
+    env->SetObjectArrayElement(j_comments, static_cast<jsize>(i), jc);
+    env->SetObjectArrayElement(j_execs, static_cast<jsize>(i), je);
+    env->SetObjectArrayElement(j_apts, static_cast<jsize>(i), ja);
+    env->DeleteLocalRef(jid);
+    env->DeleteLocalRef(jn);
+    env->DeleteLocalRef(jc);
+    env->DeleteLocalRef(je);
+    env->DeleteLocalRef(ja);
+  }
+  if (count > 0) {
+    env->SetBooleanArrayRegion(j_installed, 0, count, inst_vals.data());
+  }
+
+  std::vector<jobject> activity_refs;
+  {
+    std::lock_guard<std::mutex> lock(g_app.slots_mutex);
+    for (const auto& [slot_id, slot] : g_app.slots) {
+      (void)slot_id;
+      if (slot.activity_global) {
+        activity_refs.push_back(env->NewLocalRef(slot.activity_global));
+      }
+    }
+  }
+
+  for (jobject act : activity_refs) {
+    if (!act) continue;
+    jclass act_cls = env->GetObjectClass(act);
+    if (act_cls) {
+      jmethodID mid = env->GetMethodID(
+          act_cls, "onGuestAppCatalogUpdated",
+          "([Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;[Z)V");
+      if (mid) {
+        env->CallVoidMethod(act, mid, j_ids, j_names, j_comments, j_execs, j_apts, j_installed);
+      } else {
+        env->ExceptionClear();
+      }
+      env->DeleteLocalRef(act_cls);
+    }
+    env->DeleteLocalRef(act);
+  }
+
+  env->DeleteLocalRef(j_ids);
+  env->DeleteLocalRef(j_names);
+  env->DeleteLocalRef(j_comments);
+  env->DeleteLocalRef(j_execs);
+  env->DeleteLocalRef(j_apts);
+  env->DeleteLocalRef(j_installed);
+  env->DeleteLocalRef(str_cls);
+
+  if (attached) {
+    g_app.jvm->DetachCurrentThread();
+  }
+#else
+  (void)entries;
+#endif
+}
+
 void EnsureServerAndPumpStarted(const std::string& socket_path,
                                 int vsock_port,
                                 int tcp_port,
@@ -593,6 +702,10 @@ void EnsureServerAndPumpStarted(const std::string& socket_path,
                "app_id='%s' icon_bytes=%zu",
                surface_id, title.c_str(), app_id.c_str(), icon_png.size());
           NotifyExternalAppLaunchListener(surface_id, title, app_id, icon_png);
+        });
+    g_app.server->SetAppCatalogCallback(
+        [](const std::vector<vkwlf::GuestAppCatalogEntry>& entries) {
+          NotifyAllActivitiesGuestCatalog(entries);
         });
 
     if (g_app.server->Initialize()) {
@@ -848,6 +961,12 @@ void AttachWindowSlot(int slot_idx,
   }
 
   UpdateSlotAssignmentsAndNotify();
+  if (g_app.server) {
+    auto catalog = g_app.server->GetGuestAppCatalog();
+    if (!catalog.empty()) {
+      NotifyAllActivitiesGuestCatalog(catalog);
+    }
+  }
 
   uint32_t target_sid = 0;
   {
@@ -857,9 +976,13 @@ void AttachWindowSlot(int slot_idx,
       target_sid = it->second.target_surface_id;
     }
   }
-  if (g_app.server && target_sid != 0) {
-    g_app.server->SetActiveInputSurface(target_sid);
-    g_app.server->SetDisplaySizeForSurface(target_sid, init_w, init_h);
+  if (g_app.server) {
+    if (target_sid != 0) {
+      g_app.server->SetActiveInputSurface(target_sid, init_w, init_h);
+      g_app.server->SetDisplaySizeForSurface(target_sid, init_w, init_h);
+    } else {
+      g_app.server->SetDisplaySize(init_w, init_h);
+    }
   }
 
   std::thread([slot_idx, window, seq, init_w, init_h, old_renderer = std::move(old_renderer),
@@ -1025,8 +1148,9 @@ void ResizeWindowSlot(int slot_idx, uint32_t width, uint32_t height) {
   }
   if (size_changed && g_app.server) {
     if (target_sid != 0) {
+      g_app.server->SetActiveInputSurface(target_sid, width, height);
       g_app.server->SetDisplaySizeForSurface(target_sid, width, height);
-    } else if (slot_idx == 0) {
+    } else {
       g_app.server->SetDisplaySize(width, height);
     }
   }
@@ -1154,6 +1278,63 @@ Java_com_google_example_vkwlf_MainActivity_nativeGetSurfaceIconPng(JNIEnv* env,
                             reinterpret_cast<const jbyte*>(icon_png.data()));
   }
   return arr;
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_google_example_vkwlf_MainActivity_nativeGetCatalogIconPng(JNIEnv* env,
+                                                                   jclass /*clazz*/,
+                                                                   jstring j_desktop_id) {
+  if (!j_desktop_id || !g_app.server) return nullptr;
+  const char* cid = env->GetStringUTFChars(j_desktop_id, nullptr);
+  std::string target_id = cid ? cid : "";
+  if (cid) env->ReleaseStringUTFChars(j_desktop_id, cid);
+  if (target_id.empty()) return nullptr;
+
+  std::vector<uint8_t> icon_png;
+  auto catalog = g_app.server->GetGuestAppCatalog();
+  for (const auto& entry : catalog) {
+    if (entry.desktop_id == target_id && !entry.icon_png.empty()) {
+      icon_png = entry.icon_png;
+      break;
+    }
+  }
+  if (icon_png.empty()) return nullptr;
+  jbyteArray arr = env->NewByteArray(static_cast<jsize>(icon_png.size()));
+  if (arr) {
+    env->SetByteArrayRegion(arr, 0, static_cast<jsize>(icon_png.size()),
+                            reinterpret_cast<const jbyte*>(icon_png.data()));
+  }
+  return arr;
+}
+
+JNIEXPORT void JNICALL
+Java_com_google_example_vkwlf_MainActivity_nativeLaunchGuestApp(JNIEnv* env,
+                                                                jclass /*clazz*/,
+                                                                jstring j_launch_spec) {
+  env->GetJavaVM(&g_app.jvm);
+  EnsureServerAndPumpStarted("/data/local/tmp/wayland-0", 5555, 5555, 1280, 720);
+  if (!j_launch_spec || !g_app.server) return;
+  const char* cspec = env->GetStringUTFChars(j_launch_spec, nullptr);
+  std::string spec = cspec ? cspec : "";
+  if (cspec) env->ReleaseStringUTFChars(j_launch_spec, cspec);
+  if (!spec.empty()) {
+    LOGI(kTag, "JNI nativeLaunchGuestApp('%s')", spec.c_str());
+    g_app.server->RequestGuestAppLaunch(spec);
+  }
+}
+
+JNIEXPORT void JNICALL
+Java_com_google_example_vkwlf_MainActivity_nativeRefreshGuestAppCatalog(JNIEnv* env,
+                                                                        jclass /*clazz*/) {
+  env->GetJavaVM(&g_app.jvm);
+  EnsureServerAndPumpStarted("/data/local/tmp/wayland-0", 5555, 5555, 1280, 720);
+  if (g_app.server) {
+    auto cached = g_app.server->GetGuestAppCatalog();
+    if (!cached.empty()) {
+      NotifyAllActivitiesGuestCatalog(cached);
+    }
+    g_app.server->RequestGuestAppLaunch("__REFRESH_CATALOG__");
+  }
 }
 
 JNIEXPORT void JNICALL

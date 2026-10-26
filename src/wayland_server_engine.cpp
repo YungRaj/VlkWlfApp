@@ -186,9 +186,12 @@ bool ResolveIconValueToPng(const std::string& icon_val, std::vector<uint8_t>* ou
 struct DesktopEntryInfo {
   std::string desktop_id;  // filename without .desktop
   std::string name;
+  std::string comment;
   std::string startup_wm_class;
   std::string exec;
   std::string icon;
+  bool no_display = false;
+  bool terminal = false;
 };
 
 bool ParseDesktopFile(const std::string& path,
@@ -219,15 +222,23 @@ bool ParseDesktopFile(const std::string& path,
     std::string v = TrimAscii(trimmed.substr(eq + 1));
     if (k == "Name" && out->name.empty()) {
       out->name = v;
+    } else if (k == "Comment" && out->comment.empty()) {
+      out->comment = v;
+    } else if (k == "GenericName" && out->comment.empty()) {
+      out->comment = v;
     } else if (k == "StartupWMClass" && out->startup_wm_class.empty()) {
       out->startup_wm_class = v;
     } else if (k == "Exec" && out->exec.empty()) {
       out->exec = v;
     } else if (k == "Icon" && out->icon.empty()) {
       out->icon = v;
+    } else if (k == "NoDisplay" || k == "Hidden") {
+      if (ToLowerAscii(v) == "true") out->no_display = true;
+    } else if (k == "Terminal") {
+      if (ToLowerAscii(v) == "true") out->terminal = true;
     }
   }
-  return !out->icon.empty();
+  return !out->name.empty() && (!out->icon.empty() || !out->exec.empty());
 }
 
 // Inspects /proc/<pid>/exe for a connected Wayland client and searches for PNG icons inside
@@ -1179,6 +1190,8 @@ void SurfaceCommit(struct wl_client* /*client*/, struct wl_resource* resource) {
       wl_array_init(&states);
       auto* act = static_cast<uint32_t*>(wl_array_add(&states, sizeof(uint32_t)));
       if (act) *act = XDG_TOPLEVEL_STATE_ACTIVATED;
+      auto* max_st = static_cast<uint32_t*>(wl_array_add(&states, sizeof(uint32_t)));
+      if (max_st) *max_st = XDG_TOPLEVEL_STATE_MAXIMIZED;
 
       xdg_toplevel_send_configure(surf->xdg_toplevel_resource,
                                   static_cast<int32_t>(engine->config().display_width),
@@ -2323,6 +2336,41 @@ void WaylandServerEngine::SetAppLaunchedCallback(AppLaunchedCallback cb) {
   app_launched_cb_ = std::move(cb);
 }
 
+void WaylandServerEngine::SetAppCatalogCallback(AppCatalogCallback cb) {
+  std::lock_guard<std::mutex> lock(app_cb_mutex_);
+  app_catalog_cb_ = std::move(cb);
+}
+
+std::vector<GuestAppCatalogEntry> WaylandServerEngine::GetGuestAppCatalog() const {
+  std::lock_guard<std::mutex> lock(app_catalog_mutex_);
+  return guest_app_catalog_;
+}
+
+void WaylandServerEngine::NotifyAppCatalogUpdated(std::vector<GuestAppCatalogEntry>&& entries) {
+  std::vector<GuestAppCatalogEntry> snapshot;
+  {
+    std::lock_guard<std::mutex> lock(app_catalog_mutex_);
+    guest_app_catalog_ = std::move(entries);
+    snapshot = guest_app_catalog_;
+  }
+  AppCatalogCallback cb;
+  {
+    std::lock_guard<std::mutex> lock(app_cb_mutex_);
+    cb = app_catalog_cb_;
+  }
+  if (cb) {
+    cb(snapshot);
+  }
+}
+
+void WaylandServerEngine::RequestGuestAppLaunch(const std::string& launch_spec) {
+  if (launch_spec.empty()) return;
+  EnqueueInputCommand(InputCommand{
+      .type = InputCommand::Type::kLaunchApp,
+      .launch_spec = launch_spec,
+  });
+}
+
 void WaylandServerEngine::NotifyAppLaunched(uint32_t surface_id,
                                             const std::string& title,
                                             const std::string& app_id,
@@ -2335,6 +2383,184 @@ void WaylandServerEngine::NotifyAppLaunched(uint32_t surface_id,
   if (cb) {
     cb(surface_id, title, app_id, icon_png);
   }
+}
+
+std::vector<GuestAppCatalogEntry> WaylandServerEngine::DiscoverLocalGuestAppCatalog() {
+  std::vector<GuestAppCatalogEntry> catalog;
+  std::unordered_map<std::string, size_t> seen_ids;
+  const auto data_dirs = GetXdgDataDirs();
+
+  auto is_ignored_desktop = [](const DesktopEntryInfo& info) -> bool {
+    if (info.no_display || info.terminal) return true;
+    std::string low_id = ToLowerAscii(info.desktop_id);
+    std::string low_name = ToLowerAscii(info.name);
+    if (low_id.find("url-handler") != std::string::npos ||
+        low_id.find("urlhandler") != std::string::npos ||
+        low_id.find("url_forwarder") != std::string::npos ||
+        low_id.find("teamvieweruri") != std::string::npos ||
+        low_id.find("xwayland") != std::string::npos ||
+        low_id.rfind("python", 0) == 0 ||
+        low_id == "vim") {
+      return true;
+    }
+    return false;
+  };
+
+  for (const auto& base_dir : data_dirs) {
+    std::string app_dir = base_dir + "/applications";
+    DIR* d = opendir(app_dir.c_str());
+    if (!d) continue;
+    struct dirent* ent = nullptr;
+    while ((ent = readdir(d)) != nullptr) {
+      std::string fname = ent->d_name;
+      if (fname.size() <= 8 || fname.substr(fname.size() - 8) != ".desktop") continue;
+      DesktopEntryInfo info;
+      if (!ParseDesktopFile(app_dir + "/" + fname, fname, &info)) continue;
+      if (is_ignored_desktop(info)) continue;
+
+      std::string low_id = ToLowerAscii(info.desktop_id);
+      if (seen_ids.find(low_id) != seen_ids.end()) continue;
+
+      GuestAppCatalogEntry entry;
+      entry.desktop_id = info.desktop_id;
+      entry.name = info.name;
+      entry.comment = info.comment;
+      entry.exec = info.exec;
+      entry.installed = true;
+      if (!info.icon.empty()) {
+        ResolveIconValueToPng(info.icon, &entry.icon_png);
+      }
+      if (entry.icon_png.empty()) {
+        ResolveIconValueToPng(info.desktop_id, &entry.icon_png);
+      }
+      seen_ids[low_id] = catalog.size();
+      catalog.push_back(std::move(entry));
+    }
+    closedir(d);
+  }
+
+  struct CuratedCandidate {
+    const char* desktop_id;
+    const char* name;
+    const char* comment;
+    const char* bin_check;
+    const char* exec_cmd;
+    const char* apt_package;
+    const char* icon_name;
+  };
+  static const CuratedCandidate kCurated[] = {
+      {"firefox-esr", "Firefox ESR", "Mozilla Firefox Web Browser (Wayland)",
+       "/usr/bin/firefox-esr", "firefox-esr", "firefox-esr", "firefox-esr"},
+      {"gimp", "GIMP", "GNU Image Manipulation Program",
+       "/usr/bin/gimp", "gimp", "gimp", "gimp"},
+      {"com.microsoft.VSCode", "Visual Studio Code", "Code Editing. Redefined.",
+       "/usr/share/code/code", "/usr/share/code/code", "code", "vscode"},
+      {"antigravity", "Antigravity", "Antigravity IDE (Wayland)",
+       "/usr/share/antigravity/antigravity", "/usr/share/antigravity/antigravity", "antigravity", "antigravity"},
+      {"com.teamviewer.TeamViewer", "TeamViewer", "Remote Control Solution (Xwayland)",
+       "/opt/teamviewer/tv_bin/TeamViewer", "/opt/teamviewer/tv_bin/TeamViewer", "teamviewer", "TeamViewer"},
+      {"chromium", "Chromium", "Chromium Web Browser (Wayland)",
+       "/usr/bin/chromium", "chromium", "chromium", "chromium"},
+      {"vlc", "VLC Media Player", "Multimedia Player & Streamer",
+       "/usr/bin/vlc", "vlc", "vlc", "vlc"},
+      {"libreoffice", "LibreOffice", "Office Productivity Suite",
+       "/usr/bin/libreoffice", "libreoffice", "libreoffice", "libreoffice-main"},
+      {"foot", "Foot Terminal", "Fast, Lightweight Wayland Terminal Emulator",
+       "/usr/bin/foot", "foot", "foot", "foot"},
+      {"weston-terminal", "Weston Terminal", "Wayland Terminal Client",
+       "/usr/bin/weston-terminal", "weston-terminal", "weston", "utilities-terminal"},
+      {"org.gnome.Nautilus", "Files (Nautilus)", "GNOME File Manager",
+       "/usr/bin/nautilus", "nautilus", "nautilus", "org.gnome.Nautilus"},
+      {"inkscape", "Inkscape", "Vector Graphics Editor",
+       "/usr/bin/inkscape", "inkscape", "inkscape", "inkscape"},
+  };
+
+  for (const auto& c : kCurated) {
+    std::string low_id = ToLowerAscii(c.desktop_id);
+    bool already_present = (seen_ids.find(low_id) != seen_ids.end());
+    if (!already_present) {
+      for (const auto& existing : catalog) {
+        if (ToLowerAscii(existing.name).find(ToLowerAscii(c.apt_package)) != std::string::npos ||
+            ToLowerAscii(existing.desktop_id).find(ToLowerAscii(c.apt_package)) != std::string::npos) {
+          already_present = true;
+          break;
+        }
+      }
+    }
+    if (already_present) continue;
+
+    struct stat st {};
+    bool bin_installed = (stat(c.bin_check, &st) == 0 && (st.st_mode & S_IXUSR));
+    GuestAppCatalogEntry entry;
+    entry.desktop_id = c.desktop_id;
+    entry.name = c.name;
+    entry.comment = c.comment;
+    entry.exec = c.exec_cmd;
+    entry.apt_package = c.apt_package;
+    entry.installed = bin_installed;
+    ResolveIconValueToPng(c.icon_name, &entry.icon_png);
+    catalog.push_back(std::move(entry));
+  }
+
+  std::sort(catalog.begin(), catalog.end(),
+            [](const GuestAppCatalogEntry& a, const GuestAppCatalogEntry& b) {
+              if (a.installed != b.installed) return a.installed > b.installed;
+              return ToLowerAscii(a.name) < ToLowerAscii(b.name);
+            });
+  return catalog;
+}
+
+bool WaylandServerEngine::SendAppCatalogOverBridgeSocket(
+    int sock_fd, const std::vector<GuestAppCatalogEntry>& entries) {
+  if (sock_fd < 0) return false;
+  std::vector<uint8_t> buf;
+  auto append_u8 = [&](uint8_t v) { buf.push_back(v); };
+  auto append_u16 = [&](uint16_t v) {
+    buf.push_back(static_cast<uint8_t>(v & 0xFF));
+    buf.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+  };
+  auto append_u32 = [&](uint32_t v) {
+    buf.push_back(static_cast<uint8_t>(v & 0xFF));
+    buf.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    buf.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    buf.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+  };
+  auto append_str16 = [&](const std::string& s) {
+    uint16_t len = static_cast<uint16_t>(std::min<size_t>(s.size(), 4096));
+    append_u16(len);
+    buf.insert(buf.end(), s.begin(), s.begin() + len);
+  };
+
+  uint32_t count = static_cast<uint32_t>(std::min<size_t>(entries.size(), 256));
+  append_u32(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    const auto& e = entries[i];
+    append_str16(e.desktop_id);
+    append_str16(e.name);
+    append_str16(e.comment);
+    append_str16(e.exec);
+    append_str16(e.apt_package);
+    append_u8(e.installed ? 1 : 0);
+    uint32_t icon_len = static_cast<uint32_t>(std::min<size_t>(e.icon_png.size(), 512 * 1024));
+    append_u32(icon_len);
+    if (icon_len > 0) {
+      buf.insert(buf.end(), e.icon_png.begin(), e.icon_png.begin() + icon_len);
+    }
+  }
+
+  BridgeFrameHeader hdr{};
+  hdr.magic = kBridgeFrameMagic;
+  hdr.surface_id = 0xFFFFFFFFu;
+  std::string tag = "__VKWLF_APP_CATALOG__";
+  hdr.app_id_len = static_cast<uint16_t>(tag.size());
+  hdr.payload_bytes = static_cast<uint32_t>(buf.size());
+
+  static std::mutex send_mu;
+  std::lock_guard<std::mutex> lock(send_mu);
+  if (!WriteAll(sock_fd, &hdr, sizeof(hdr))) return false;
+  if (!WriteAll(sock_fd, tag.data(), hdr.app_id_len)) return false;
+  if (!buf.empty() && !WriteAll(sock_fd, buf.data(), buf.size())) return false;
+  return true;
 }
 
 bool WaylandServerEngine::Initialize() {
@@ -2548,6 +2774,63 @@ int WaylandServerEngine::OnBridgeClientDataEvent(int fd, uint32_t /*mask*/, void
     return disconnect_client();
   }
 
+  if (hdr.surface_id == 0xFFFFFFFFu && app_id == "__VKWLF_APP_CATALOG__") {
+    size_t pos = 0;
+    auto read_u8 = [&](uint8_t* out) -> bool {
+      if (pos + 1 > payload.size()) return false;
+      *out = payload[pos++];
+      return true;
+    };
+    auto read_u16 = [&](uint16_t* out) -> bool {
+      if (pos + 2 > payload.size()) return false;
+      *out = static_cast<uint16_t>(payload[pos]) |
+             (static_cast<uint16_t>(payload[pos + 1]) << 8);
+      pos += 2;
+      return true;
+    };
+    auto read_u32 = [&](uint32_t* out) -> bool {
+      if (pos + 4 > payload.size()) return false;
+      *out = static_cast<uint32_t>(payload[pos]) |
+             (static_cast<uint32_t>(payload[pos + 1]) << 8) |
+             (static_cast<uint32_t>(payload[pos + 2]) << 16) |
+             (static_cast<uint32_t>(payload[pos + 3]) << 24);
+      pos += 4;
+      return true;
+    };
+    auto read_str16 = [&](std::string* out) -> bool {
+      uint16_t len = 0;
+      if (!read_u16(&len) || pos + len > payload.size()) return false;
+      out->assign(reinterpret_cast<const char*>(payload.data() + pos), len);
+      pos += len;
+      return true;
+    };
+
+    uint32_t count = 0;
+    if (read_u32(&count) && count <= 256) {
+      std::vector<GuestAppCatalogEntry> entries;
+      entries.reserve(count);
+      for (uint32_t i = 0; i < count; ++i) {
+        GuestAppCatalogEntry e;
+        uint8_t inst = 0;
+        uint32_t icon_len = 0;
+        if (!read_str16(&e.desktop_id) || !read_str16(&e.name) || !read_str16(&e.comment) ||
+            !read_str16(&e.exec) || !read_str16(&e.apt_package) || !read_u8(&inst) ||
+            !read_u32(&icon_len) || pos + icon_len > payload.size()) {
+          break;
+        }
+        e.installed = (inst != 0);
+        if (icon_len > 0) {
+          e.icon_png.assign(payload.begin() + pos, payload.begin() + pos + icon_len);
+          pos += icon_len;
+        }
+        entries.push_back(std::move(e));
+      }
+      LOGI(kTag, "Received guest Linux app catalog (%zu entries) over bridge", entries.size());
+      engine->NotifyAppCatalogUpdated(std::move(entries));
+    }
+    return 0;
+  }
+
   CommittedFrame frame;
   frame.surface_id = hdr.surface_id;
   frame.parent_surface_id = hdr.parent_surface_id;
@@ -2707,7 +2990,9 @@ void WaylandServerEngine::ForwardInputCommandToBridgeClients(const InputCommand&
   pkt.mods_latched = cmd.mods_latched;
   pkt.mods_locked = cmd.mods_locked;
   pkt.group = cmd.group;
-  if (cmd.type != InputCommand::Type::kKeyboardModifiers) {
+  if (cmd.type == InputCommand::Type::kLaunchApp) {
+    pkt.button_or_key = static_cast<uint32_t>(std::min<size_t>(cmd.launch_spec.size(), 4096));
+  } else if (cmd.type != InputCommand::Type::kKeyboardModifiers) {
     pkt.mods_locked = cmd.target_surface_id;
     pkt.mods_latched = cmd.host_width > 0 ? cmd.host_width : config_.display_width;
     pkt.group = cmd.host_height > 0 ? cmd.host_height : config_.display_height;
@@ -2717,6 +3002,9 @@ void WaylandServerEngine::ForwardInputCommandToBridgeClients(const InputCommand&
   for (auto& bc : bridge_clients_) {
     if (bc && bc->fd >= 0) {
       WriteAll(bc->fd, &pkt, sizeof(pkt));
+      if (cmd.type == InputCommand::Type::kLaunchApp && pkt.button_or_key > 0) {
+        WriteAll(bc->fd, cmd.launch_spec.data(), pkt.button_or_key);
+      }
     }
   }
 }
@@ -2727,6 +3015,54 @@ bool WaylandServerEngine::ProcessBridgeInputFromHost(int sock_fd) {
     return false;
   }
   auto type = static_cast<InputCommand::Type>(pkt.type);
+  if (type == InputCommand::Type::kLaunchApp) {
+    uint32_t len = pkt.button_or_key;
+    std::string spec;
+    if (len > 0 && len <= 4096) {
+      spec.resize(len);
+      if (!ReadAll(sock_fd, spec.data(), len)) {
+        return false;
+      }
+    }
+    if (spec == "__REFRESH_CATALOG__") {
+      auto entries = DiscoverLocalGuestAppCatalog();
+      SendAppCatalogOverBridgeSocket(sock_fd, entries);
+      return true;
+    }
+    if (!spec.empty()) {
+      LOGI(kTag, "Received host app launch request over bridge: '%s'", spec.c_str());
+      const std::string sock_path = bound_socket_path_;
+      std::thread([spec, sock_fd, sock_path]() {
+        bool is_install = (spec.rfind("install:", 0) == 0);
+        std::string target = is_install ? spec.substr(8) : spec;
+        // Write to /tmp/vkwlf-xdg-<uid>/launch.req so vkwlf-auto-bridge or vkwlf-launch-app handles it
+        std::string cmd = "/usr/local/bin/vkwlf-launch-app ";
+        if ( !sock_path.empty()) {
+          cmd += "--socket '" + sock_path + "' ";
+        }
+        if (is_install) {
+          cmd += "--install ";
+        }
+        // Safely single-quote target
+        std::string safe_target;
+        for (char c : target) {
+          if (c == '\'') {
+            safe_target += "'\\''";
+          } else {
+            safe_target.push_back(c);
+          }
+        }
+        cmd += "'" + safe_target + "' >/tmp/vkwlf-launch.log 2>&1";
+        int rc = std::system(cmd.c_str());
+        (void)rc;
+        if (is_install) {
+          auto updated = DiscoverLocalGuestAppCatalog();
+          SendAppCatalogOverBridgeSocket(sock_fd, updated);
+        }
+      }).detach();
+    }
+    return true;
+  }
   uint32_t target_sid = 0;
   uint32_t pkt_hw = 0;
   uint32_t pkt_hh = 0;
@@ -2958,16 +3294,20 @@ void WaylandServerEngine::ProcessPendingInputCommands() {
       }
     }
 
-    if (cmd.type == InputCommand::Type::kFocusSurface) {
+    if (cmd.type == InputCommand::Type::kFocusSurface ||
+        cmd.type == InputCommand::Type::kLaunchApp) {
       continue;
     }
 
     if (cmd.type == InputCommand::Type::kDisplayResize) {
       uint32_t target_w = cmd.x > 0 ? static_cast<uint32_t>(cmd.x) : config_.display_width;
       uint32_t target_h = cmd.y > 0 ? static_cast<uint32_t>(cmd.y) : config_.display_height;
+      if (cmd.target_surface_id == 0) {
+        continue;
+      }
       for (const auto& entry : toplevel_entries_) {
         if (entry.xdg_toplevel_res && entry.xdg_surface_res) {
-          if (cmd.target_surface_id != 0 && entry.surface_res) {
+          if (entry.surface_res) {
             auto* surf = static_cast<SurfaceState*>(wl_resource_get_user_data(entry.surface_res));
             if (surf && surf->id != cmd.target_surface_id) {
               continue;
