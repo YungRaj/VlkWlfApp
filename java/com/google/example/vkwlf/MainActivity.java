@@ -53,6 +53,7 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -254,6 +255,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return "Antigravity";
     }
 
+    private static String deriveWindowPillLabel(
+            String title, String appId, int sameAppOrdinal, int sameAppTotal) {
+        String baseLabel = deriveAppLabel(title, appId);
+        if (sameAppTotal <= 1) {
+            return baseLabel;
+        }
+        if (title != null && !title.trim().isEmpty()) {
+            String cleanTitle = title.replaceAll("\\s*\\[[^\\]]*\\]\\s*$", "").trim();
+            String[] parts = cleanTitle.split("\\s+(?:—|–|-)\\s+");
+            for (String part : parts) {
+                String p = part.trim();
+                if (!p.isEmpty()
+                        && !p.equalsIgnoreCase(baseLabel)
+                        && !p.toLowerCase().contains(baseLabel.toLowerCase())) {
+                    if (p.length() > 18) {
+                        p = p.substring(0, 17) + "…";
+                    }
+                    return baseLabel + " · " + p;
+                }
+            }
+        }
+        return baseLabel + " #" + sameAppOrdinal;
+    }
+
     private int resolveFallbackIconRes(String title, String appId) {
         String combined =
                 ((title != null ? title : "") + " " + (appId != null ? appId : "")).toLowerCase();
@@ -313,6 +338,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private Class<? extends MainActivity> resolveActivityClassForSurface(
             int surfaceId, String titleOrLabel, String appId) {
+        if (surfaceId > 0) {
+            MainActivity existingForSid = findOpenActivityBySurface(surfaceId);
+            if (existingForSid != null) {
+                return existingForSid.getClass();
+            }
+        }
         String label = deriveAppLabel(titleOrLabel, appId);
         if ((titleOrLabel == null || titleOrLabel.isEmpty())
                 && (appId == null || appId.isEmpty())
@@ -335,10 +366,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
         if (low.contains("antigravity")) {
             return MainActivity.class;
-        }
-        MainActivity existingForSid = findOpenActivityBySurface(surfaceId);
-        if (existingForSid != null) {
-            return existingForSid.getClass();
         }
         if ((getClass() == GenericWaylandActivity.class
                         || getClass() == GenericWaylandActivity2.class)
@@ -1282,12 +1309,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
 
         if (mAppSwitcherBar == null) return;
+        Map<String, Integer> appCounts = new HashMap<>();
+        for (int i = 0; i < surfaceIds.length; i++) {
+            String t = i < titles.length ? titles[i] : "";
+            String a = i < appIds.length ? appIds[i] : "";
+            String baseLbl = deriveAppLabel(t, a);
+            appCounts.put(baseLbl, appCounts.getOrDefault(baseLbl, 0) + 1);
+        }
+
         StringBuilder sigBuilder = new StringBuilder();
         sigBuilder.append(boundSurfaceId).append('|');
         for (int i = 0; i < surfaceIds.length; i++) {
             String t = i < titles.length ? titles[i] : "";
             String a = i < appIds.length ? appIds[i] : "";
-            sigBuilder.append(surfaceIds[i]).append(':').append(deriveAppLabel(t, a)).append(';');
+            sigBuilder
+                    .append(surfaceIds[i])
+                    .append(':')
+                    .append(deriveAppLabel(t, a))
+                    .append(':')
+                    .append(t)
+                    .append(';');
         }
         String sig = sigBuilder.toString();
         if (sig.equals(mLastSwitcherSignature) && mAppSwitcherBar.getChildCount() > 0) {
@@ -1298,12 +1339,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         mAppSwitcherBar.removeAllViews();
         final float dp = getResources().getDisplayMetrics().density;
         final boolean night = isNightMode();
+        Map<String, Integer> appOrdinals = new HashMap<>();
 
         for (int i = 0; i < surfaceIds.length; i++) {
             final int sid = surfaceIds[i];
             final String t = i < titles.length ? titles[i] : "";
             final String a = i < appIds.length ? appIds[i] : "";
             final String shortLabel = deriveAppLabel(t, a);
+            final int totalSameApp = appCounts.getOrDefault(shortLabel, 1);
+            final int ordinalSameApp = appOrdinals.getOrDefault(shortLabel, 0) + 1;
+            appOrdinals.put(shortLabel, ordinalSameApp);
+            final String pillLabel =
+                    deriveWindowPillLabel(t, a, ordinalSameApp, totalSameApp);
             final boolean selected = (sid == boundSurfaceId);
 
             LinearLayout pill = new LinearLayout(this);
@@ -1335,7 +1382,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             pill.addView(pillIcon, pilp);
 
             TextView pillText = new TextView(this);
-            pillText.setText(shortLabel);
+            pillText.setText(pillLabel);
             pillText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
             pillText.setTypeface(Typeface.DEFAULT, selected ? Typeface.BOLD : Typeface.NORMAL);
             pillText.setTextColor(selected ? 0xFFFFFFFF : (night ? 0xFFD0D0D8 : 0xFF202124));

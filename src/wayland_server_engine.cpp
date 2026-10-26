@@ -3284,9 +3284,17 @@ void WaylandServerEngine::ProcessPendingInputCommands() {
         auto* surf = static_cast<SurfaceState*>(wl_resource_get_user_data(entry.surface_res));
         if (surf && surf->id == cmd.target_surface_id) {
           preferred_base_surface_ = entry.surface_res;
-          if (!focused_surface_ ||
-              wl_resource_get_client(focused_surface_) !=
+          bool keep_child_focus = false;
+          if (focused_surface_ && focused_surface_ != entry.surface_res &&
+              cmd.type != InputCommand::Type::kFocusSurface &&
+              wl_resource_get_client(focused_surface_) ==
                   wl_resource_get_client(entry.surface_res)) {
+            auto* f_surf = static_cast<SurfaceState*>(wl_resource_get_user_data(focused_surface_));
+            if (f_surf && (f_surf->is_popup || f_surf->parent_surface_id == surf->id)) {
+              keep_child_focus = true;
+            }
+          }
+          if (!focused_surface_ || (focused_surface_ != entry.surface_res && !keep_child_focus)) {
             SetFocusedSurface(entry.surface_res);
           }
           break;
@@ -3910,8 +3918,11 @@ struct wl_resource* WaylandServerEngine::ResolvePointerTarget(double screen_x,
   }
 
   if (mapped_count > 1) {
+    auto* base_surf = base_surface
+                          ? static_cast<SurfaceState*>(wl_resource_get_user_data(base_surface))
+                          : nullptr;
     for (auto it = toplevel_entries_.rbegin(); it != toplevel_entries_.rend(); ++it) {
-      if (!it->surface_res) continue;
+      if (!it->surface_res || it->surface_res == base_surface) continue;
       if (base_surface &&
           wl_resource_get_client(it->surface_res) != wl_resource_get_client(base_surface)) {
         continue;
@@ -3922,8 +3933,9 @@ struct wl_resource* WaylandServerEngine::ResolvePointerTarget(double screen_x,
         continue;
       }
       const bool is_dialog_size =
-          (surf->committed_width < (config_.display_width * 3) / 4 ||
-           surf->committed_height < (config_.display_height * 3) / 4);
+          (base_surf && surf->parent_surface_id == base_surf->id) ||
+          (surf->parent_surface_id == 0 &&
+           (surf->committed_width < 640 || surf->committed_height < 400));
       if (!is_dialog_size) continue;
 
       int32_t dx = (static_cast<int32_t>(config_.display_width) -

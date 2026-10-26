@@ -218,6 +218,22 @@ if [[ "$LOW_SPEC" == *"gimp"* ]]; then
   exit 0
 fi
 
+if [[ "$LOW_SPEC" == *"cursor"* ]]; then
+  if [[ ! -x /usr/share/cursor/cursor ]] && ! command -v cursor >/dev/null 2>&1; then
+    install_package_if_needed "cursor" || true
+  fi
+  CURSOR_BIN="/usr/share/cursor/cursor"
+  [[ -x "$CURSOR_BIN" ]] || CURSOR_BIN="$(command -v cursor || echo /usr/share/cursor/cursor)"
+  unset DISPLAY
+  export GDK_BACKEND=wayland QT_QPA_PLATFORM=wayland ELECTRON_OZONE_PLATFORM_HINT=wayland
+  nohup "$CURSOR_BIN" --no-sandbox \
+    --ozone-platform=wayland \
+    --enable-features=UseOzonePlatform \
+    --ignore-gpu-blocklist \
+    --user-data-dir="$HOME/.config/Cursor-vkwlf" > "$RT/cursor.log" 2>&1 &
+  exit 0
+fi
+
 # 2. General .desktop file resolution or custom command execution
 EXEC_CMD=""
 DESKTOP_FILE="$(find_desktop_file "$SPEC" || true)"
@@ -253,8 +269,8 @@ export MOZ_ENABLE_WAYLAND=1
 export ELECTRON_OZONE_PLATFORM_HINT=wayland
 export SDL_VIDEODRIVER=wayland
 
-# Add Wayland Ozone flags automatically for Chromium/Electron-based browsers
-if [[ "$EXEC_CMD" == *"chromium"* || "$EXEC_CMD" == *"google-chrome"* || "$EXEC_CMD" == *"brave"* ]]; then
+# Add Wayland Ozone flags automatically for Chromium/Electron-based browsers & IDEs
+if [[ "$EXEC_CMD" == *"chromium"* || "$EXEC_CMD" == *"google-chrome"* || "$EXEC_CMD" == *"brave"* || "$EXEC_CMD" == *"cursor"* ]]; then
   EXEC_CMD="$EXEC_CMD --no-sandbox --ozone-platform=wayland --enable-features=UseOzonePlatform --ignore-gpu-blocklist"
 fi
 

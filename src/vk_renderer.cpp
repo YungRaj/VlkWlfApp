@@ -2034,13 +2034,17 @@ bool VkRenderer::RecordAndSubmitRenderPass(uint32_t image_index, const SurfaceTe
       const bool is_child_dialog =
           (surf_tex.parent_surface_id == target_surface_id_) ||
           (!target_app_id.empty() && surf_tex.app_id == target_app_id &&
-           (surf_tex.width < (swapchain_extent_.width * 3) / 4 ||
-            surf_tex.height < (swapchain_extent_.height * 3) / 4));
+           surf_tex.parent_surface_id == 0 &&
+           (surf_tex.width < 640 || surf_tex.height < 400));
       if (!is_child_dialog) continue;
     }
     base_sids.push_back(sid);
   }
   std::sort(base_sids.begin(), base_sids.end(), [this](uint32_t a, uint32_t b) {
+    if (target_surface_id_ != 0) {
+      if (a == target_surface_id_ && b != target_surface_id_) return true;
+      if (b == target_surface_id_ && a != target_surface_id_) return false;
+    }
     const auto& ta = surface_textures_[a];
     const auto& tb = surface_textures_[b];
     const uint64_t area_a = static_cast<uint64_t>(ta.width) * ta.height;
@@ -2051,8 +2055,9 @@ bool VkRenderer::RecordAndSubmitRenderPass(uint32_t image_index, const SurfaceTe
   for (uint32_t sid : base_sids) {
     const auto& surf_tex = surface_textures_[sid];
     const bool is_dialog_size =
-        (base_sids.size() > 1) && (surf_tex.width > 0 && surf_tex.height > 0) &&
-        (surf_tex.parent_surface_id != 0 || surf_tex.width < 640 || surf_tex.height < 400);
+        (target_surface_id_ != 0 && sid != target_surface_id_) ||
+        ((base_sids.size() > 1) && (surf_tex.width > 0 && surf_tex.height > 0) &&
+         (surf_tex.parent_surface_id != 0 || surf_tex.width < 640 || surf_tex.height < 400));
     if (is_dialog_size) {
       int32_t dx = (static_cast<int32_t>(swapchain_extent_.width) -
                     static_cast<int32_t>(surf_tex.width)) /

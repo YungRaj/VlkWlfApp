@@ -410,13 +410,15 @@ void UpdateSlotAssignmentsAndNotify() {
   {
     std::lock_guard<std::mutex> lock(g_app.slots_mutex);
     std::set<uint32_t> claimed_sids;
-    // Pass 1: Honor user-pinned / intent-bound surfaces that are still active.
+    // Pass 1: Honor any slot whose currently bound surface is still active so multi-window apps
+    // never involuntarily jump between surfaces.
     for (auto& [slot_id, slot] : g_app.slots) {
       (void)slot_id;
-      if (slot.user_pinned_surface && slot.target_surface_id != 0) {
+      if (slot.target_surface_id != 0) {
         for (const auto& app : base_apps) {
           if (app.surface_id == slot.target_surface_id) {
             claimed_sids.insert(slot.target_surface_id);
+            slot.user_pinned_surface = true;
             break;
           }
         }
@@ -716,15 +718,20 @@ void EnsureServerAndPumpStarted(const std::string& socket_path,
 
   if (!g_app.pump_running.exchange(true)) {
     g_app.pump_thread = std::thread([]() {
+      std::set<uint32_t> seen_base_toplevel_sids;
       while (g_app.pump_running.load()) {
         vkwlf::CommittedFrame frame;
         if (!g_app.server || !g_app.server->PopCommittedFrame(&frame, 16)) {
           continue;
         }
         bool topology_or_meta_changed = false;
+        uint32_t newly_opened_same_app_sid = 0;
+        uint32_t newly_opened_resize_w = 0;
+        uint32_t newly_opened_resize_h = 0;
         {
           std::lock_guard<std::mutex> lock(g_app.cache_mutex);
           if (frame.is_unmapped) {
+            seen_base_toplevel_sids.erase(frame.surface_id);
             auto it = g_app.cached_frames.find(frame.surface_id);
             if (it != g_app.cached_frames.end()) {
               if (it->second.dmabuf_fd >= 0) close(it->second.dmabuf_fd);
@@ -735,41 +742,51 @@ void EnsureServerAndPumpStarted(const std::string& socket_path,
               topology_or_meta_changed = true;
             }
           } else if (!frame.shm_pixels.empty() || frame.dmabuf_fd >= 0) {
+            auto it = g_app.cached_frames.find(frame.surface_id);
+            const bool is_first_base_toplevel_commit =
+                IsBaseToplevelFrame(frame) &&
+                seen_base_toplevel_sids.insert(frame.surface_id).second;
             if (IsBaseToplevelFrame(frame)) {
               std::string new_key = CanonicalAppKey(frame);
               if (!new_key.empty()) {
-                for (auto cit = g_app.cached_frames.begin(); cit != g_app.cached_frames.end();) {
-                  if (cit->first != frame.surface_id && IsBaseToplevelFrame(cit->second) &&
-                      CanonicalAppKey(cit->second) == new_key) {
-                    const uint32_t old_sid = cit->first;
-                    if (frame.icon_png.empty() && !cit->second.icon_png.empty()) {
-                      frame.icon_png = cit->second.icon_png;
+                // Inherit app icon from any existing window of the same app if missing,
+                // while keeping all live windows of the same app in cached_frames so
+                // multiple windows per app coexist without ping-ponging.
+                for (const auto& [other_sid, other_frame] : g_app.cached_frames) {
+                  if (other_sid != frame.surface_id && IsBaseToplevelFrame(other_frame) &&
+                      CanonicalAppKey(other_frame) == new_key) {
+                    if (frame.icon_png.empty() && !other_frame.icon_png.empty()) {
+                      frame.icon_png = other_frame.icon_png;
+                      break;
                     }
-                    if (cit->second.dmabuf_fd >= 0) close(cit->second.dmabuf_fd);
-                    for (auto& p : cit->second.planes) {
-                      if (p.fd >= 0) close(p.fd);
-                    }
-                    cit = g_app.cached_frames.erase(cit);
-                    {
-                      std::lock_guard<std::mutex> slock(g_app.slots_mutex);
-                      for (auto& [sid_slot, s] : g_app.slots) {
-                        (void)sid_slot;
-                        if (s.target_surface_id == old_sid) {
-                          s.target_surface_id = frame.surface_id;
-                          if (s.renderer) {
-                            s.renderer->SetTargetSurfaceId(frame.surface_id);
-                          }
+                  }
+                }
+                if (is_first_base_toplevel_commit) {
+                  std::lock_guard<std::mutex> slock(g_app.slots_mutex);
+                  for (auto& [sid_slot, s] : g_app.slots) {
+                    (void)sid_slot;
+                    if (s.target_surface_id != 0 && s.target_surface_id != frame.surface_id) {
+                      auto old_it = g_app.cached_frames.find(s.target_surface_id);
+                      if (old_it != g_app.cached_frames.end() &&
+                          CanonicalAppKey(old_it->second) == new_key) {
+                        s.target_surface_id = frame.surface_id;
+                        s.user_pinned_surface = true;
+                        if (s.renderer) {
+                          s.renderer->SetTargetSurfaceId(frame.surface_id);
                         }
+                        newly_opened_same_app_sid = frame.surface_id;
+                        if (s.window != nullptr && s.width > 0 && s.height > 0) {
+                          newly_opened_resize_w = s.width;
+                          newly_opened_resize_h = s.height;
+                        }
+                        topology_or_meta_changed = true;
+                        break;
                       }
                     }
-                    topology_or_meta_changed = true;
-                  } else {
-                    ++cit;
                   }
                 }
               }
             }
-            auto it = g_app.cached_frames.find(frame.surface_id);
             if (it == g_app.cached_frames.end()) {
               topology_or_meta_changed = true;
             } else {
@@ -787,6 +804,17 @@ void EnsureServerAndPumpStarted(const std::string& socket_path,
               }
             }
             g_app.cached_frames[frame.surface_id] = CloneFrameForRenderer(frame, true);
+          }
+        }
+
+        if (newly_opened_same_app_sid != 0 && g_app.server) {
+          if (newly_opened_resize_w > 0 && newly_opened_resize_h > 0) {
+            g_app.server->SetActiveInputSurface(newly_opened_same_app_sid, newly_opened_resize_w,
+                                                newly_opened_resize_h);
+            g_app.server->SetDisplaySizeForSurface(newly_opened_same_app_sid, newly_opened_resize_w,
+                                                   newly_opened_resize_h);
+          } else {
+            g_app.server->SetActiveInputSurface(newly_opened_same_app_sid);
           }
         }
 
